@@ -243,7 +243,7 @@ jobs:
 
   triage:
     # Nightly only: PR and push runs must not open issues or write the history cache.
-    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ) && github.repository_owner == 'deephaven' && !cancelled() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-22.04
     needs: [merge-reports]
     permissions:
