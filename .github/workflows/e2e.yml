@@ -8,6 +8,7 @@ on:
       - main
       - 'release/**'
       - 'feature/**'
+      - dh-23793-test
   pull_request:
     branches:
       - main
