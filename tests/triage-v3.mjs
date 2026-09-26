@@ -653,6 +653,18 @@ async function main() {
   if (gh) {
     const tracked = Object.entries(history.fingerprints)
       .filter(([, s]) => s.issueNumber)
+      .sort(([fpA, a], [fpB, b]) => {
+        // Prioritize fingerprints failing this run (their issueState decides reopening below),
+        // then the rest by recency, so a long tail of old tracked issues can't crowd out the
+        // refreshes that actually matter once the list exceeds MAX_ISSUE_STATE_REFRESHES.
+        const seenA = seenThisRun.has(fpA);
+        const seenB = seenThisRun.has(fpB);
+        if (seenA !== seenB) return seenA ? -1 : 1;
+        return (
+          (Date.parse(b.lastSeenAt ?? '') || 0) -
+          (Date.parse(a.lastSeenAt ?? '') || 0)
+        );
+      })
       .slice(0, MAX_ISSUE_STATE_REFRESHES);
     await Promise.all(
       tracked.map(async ([fp, state]) => {
