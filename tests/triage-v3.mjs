@@ -553,7 +553,7 @@ async function main() {
         counts[status] = (counts[status] ?? 0) + 1;
 
         const project = test.projectName ?? '';
-        const testKey = `${spec.file}::${spec.title}::${project}`;
+        const testKey = `${spec.file}:${spec.line}::${spec.title}::${project}`;
         const lastResult = test.results?.at(-1);
         // For a 'flaky' test the LAST result is the retry that finally passed and
         // carries no error -- walk backwards for the attempt that actually failed.
