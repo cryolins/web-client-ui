@@ -41,7 +41,7 @@ import {
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 
-// ---------- config ----------
+// ---------- config -----------
 
 const HISTORY_WINDOW = Number(process.env.HISTORY_WINDOW ?? 20);
 const ESCALATE_AFTER_ATTEMPTS = Number(
