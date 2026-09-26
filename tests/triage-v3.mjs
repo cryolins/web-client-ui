@@ -540,7 +540,7 @@ async function main() {
   const failing = [];
   const counts = { total: 0, expected: 0, flaky: 0, unexpected: 0, skipped: 0 };
 
-  function walk(suite) {
+  function walk(suite, titlePath = []) {
     (suite.specs ?? []).forEach(spec => {
       // One entry per browser project, not just the first.
       (spec.tests ?? []).forEach(test => {
@@ -553,7 +553,11 @@ async function main() {
         counts[status] = (counts[status] ?? 0) + 1;
 
         const project = test.projectName ?? '';
-        const testKey = `${spec.file}:${spec.line}::${spec.title}::${project}`;
+        // Keyed on describe-block ancestry + own title rather than line/column, so moving
+        // a test in its file doesn't silently reset its accumulated flake history.
+        const testKey = `${spec.file}::${[...titlePath, spec.title].join(
+          ' > '
+        )}::${project}`;
         const lastResult = test.results?.at(-1);
         // For a 'flaky' test the LAST result is the retry that finally passed and
         // carries no error -- walk backwards for the attempt that actually failed.
@@ -589,7 +593,9 @@ async function main() {
         }
       });
     });
-    (suite.suites ?? []).forEach(child => walk(child));
+    (suite.suites ?? []).forEach(child =>
+      walk(child, suite.title ? [...titlePath, suite.title] : titlePath)
+    );
   }
   walk(report);
 
@@ -610,14 +616,19 @@ async function main() {
   });
 
   const decisions = [...groups.entries()].map(([fp, group]) => {
-    const testKeys = group.map(g => g.testKey);
-    const { flakeRate, historyWindow } = groupStats(history, testKeys);
+    const state = fingerprintState(history, fp);
+    // Accumulate every test ever seen under this fingerprint, not just tonight's failures --
+    // otherwise a sibling test that shares the root cause but passed tonight contributes
+    // nothing, and the rate swings based on which subset of tests happened to fail tonight.
+    state.testKeys = [
+      ...new Set([...(state.testKeys ?? []), ...group.map(g => g.testKey)]),
+    ];
+    const { flakeRate, historyWindow } = groupStats(history, state.testKeys);
     // 'unexpected' dominates: if any project failed outright, treat the group as a hard failure.
     const status = group.some(g => g.status === 'unexpected')
       ? 'unexpected'
       : 'flaky';
     const classification = classify(status, flakeRate, historyWindow);
-    const state = fingerprintState(history, fp);
     const decision = decide({
       testFiles: [...new Set(group.map(g => g.file))],
       classification,
