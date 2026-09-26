@@ -78,11 +78,21 @@ const MARKER = fp => `<!-- test-health-fingerprint: ${fp} -->`;
 
 // ---------- fingerprinting ----------
 
+// Matches any CSI escape sequence (colors, cursor movement, etc.), not just `m` (SGR/color).
+// Playwright's expect() output is colorized with these; left in place they get embedded raw
+// in the issue body and render as mangled glyphs (e.g. `<0x1b>[31m` -> `<20>[31m`) once GitHub
+// re-encodes the markdown, so this must be stripped from anything we actually display, not
+// just from the copy we hash for fingerprinting.
+const ANSI_PATTERN = /\u001b\[[0-9;]*[a-zA-Z]/g;
+
+function stripAnsi(text = '') {
+  return text.replace(ANSI_PATTERN, '');
+}
+
 // Strip anything that varies run-to-run (ids, line numbers, timestamps) so
 // the same underlying bug hashes to the same fingerprint every time.
 function normalizeError(message = '', stackTop = '') {
-  return `${message}\n${stackTop}`
-    .replace(/\u001b\[[0-9;]*m/g, '')
+  return stripAnsi(`${message}\n${stackTop}`)
     .replace(
       /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
       '<uuid>'
@@ -569,8 +579,11 @@ async function main() {
             project,
             status,
             fp: fingerprint(error),
-            error: { message: error.message ?? '', stack: error.stack ?? '' },
-            pageSnapshot: extractErrorContext(error, attachments),
+            error: {
+              message: stripAnsi(error.message ?? ''),
+              stack: stripAnsi(error.stack ?? ''),
+            },
+            pageSnapshot: stripAnsi(extractErrorContext(error, attachments)),
             attachments: attachments.map(a => a.name ?? a.path).filter(Boolean),
           });
         }
