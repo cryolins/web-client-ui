@@ -53,6 +53,7 @@ type Classification =
   | 'new_hard_failure';
 type Route = 'no_action' | 'escalate' | 'auto_fix_candidate';
 
+// Identifies which CI run produced a history record or issue comment.
 interface RunContext {
   runId: string;
   runUrl: string;
@@ -62,15 +63,18 @@ interface RunContext {
   timestamp: string;
 }
 
+// One test's outcome for a single run, appended to its rolling history window.
 interface RunRecord extends RunContext {
   status: TestStatus;
   durationMs: number;
 }
 
+// Rolling window of recent run outcomes for one test key.
 interface TestHistoryEntry {
   runs: RunRecord[];
 }
 
+// Whether closing a fingerprint's issue actually fixed it or the failure came back.
 interface FixAttempt {
   outcome: FixOutcome;
   issueNumber: number;
@@ -78,6 +82,7 @@ interface FixAttempt {
   at: string;
 }
 
+// Persisted, cross-run state tracked for one fingerprint.
 interface FingerprintState {
   fixAttempts: FixAttempt[];
   cleanRunsSinceClose: number;
@@ -89,17 +94,19 @@ interface FingerprintState {
   openedAt?: string;
 }
 
+// Root shape of the history.json cache restored/saved via actions/cache.
 interface HistoryStore {
-  version: number;
   tests: Record<string, TestHistoryEntry>;
   fingerprints: Record<string, FingerprintState>;
 }
 
+// ANSI-stripped error message/stack captured for a failing test.
 interface ErrorInfo {
   message: string;
   stack: string;
 }
 
+// Minimal identity of one test contributing to a fingerprint's bundle.
 interface TestRef {
   file: string;
   title: string;
@@ -107,6 +114,7 @@ interface TestRef {
   status: FailingStatus;
 }
 
+// Aggregated view of one fingerprint's failures, used to render its issue body.
 interface Bundle {
   fingerprint: string;
   status: FailingStatus;
@@ -120,6 +128,7 @@ interface Bundle {
   traceAttachments: string[];
 }
 
+// The routing outcome computed for one fingerprint, plus what was done about it.
 interface Decision {
   route: Route;
   reason: string;
@@ -129,6 +138,7 @@ interface Decision {
   issueError?: string;
 }
 
+// One flaky/failed test occurrence extracted from the Playwright report while walking it.
 interface FailingTest {
   testKey: string;
   file: string;
@@ -143,54 +153,63 @@ interface FailingTest {
 
 // Minimal shape of Playwright's merged JSON reporter output -- only the
 // fields this script reads, not the full public schema.
+// Structured form of `error.errorContext` when Playwright supplies an object instead of a string.
 interface PlaywrightErrorContext {
   value?: string;
   text?: string;
   body?: string;
 }
 
+// Failure details for a single test-result attempt.
 interface PlaywrightError {
   message?: string;
   stack?: string;
   errorContext?: string | PlaywrightErrorContext;
 }
 
+// A file or inline blob attached to a result (traces, screenshots, error context snapshots).
 interface PlaywrightAttachment {
   name?: string;
   path?: string;
   body?: string;
 }
 
+// One attempt (initial run or retry) of a test.
 interface PlaywrightResult {
   duration?: number;
   error?: PlaywrightError;
   attachments?: PlaywrightAttachment[];
 }
 
+// A test as executed under one Playwright project (e.g. one browser).
 interface PlaywrightTest {
   status: TestStatus;
   projectName?: string;
   results?: PlaywrightResult[];
 }
 
+// One `test()` definition and its per-project results.
 interface PlaywrightSpec {
   file: string;
   title: string;
   tests?: PlaywrightTest[];
 }
 
+// A describe block or file grouping, recursively containing specs and child suites.
 interface PlaywrightSuite {
   title?: string;
   specs?: PlaywrightSpec[];
   suites?: PlaywrightSuite[];
 }
 
+// Fields read back from the GitHub REST API for an issue.
 interface GithubIssue {
   number: number;
   state: 'open' | 'closed';
   body?: string;
 }
 
+// Thin wrapper over the subset of the GitHub REST API this script needs.
 interface GithubClient {
   getIssue: (number: number) => Promise<GithubIssue>;
   updateIssue: (
@@ -202,6 +221,7 @@ interface GithubClient {
   openIssuesWithLabel: (label: string) => Promise<GithubIssue[]>;
 }
 
+// Parsed --flag values from argv; the index signature allows arbitrary passthrough flags.
 interface CliArgs {
   dryRun: boolean;
   report?: string;
@@ -283,6 +303,7 @@ function firstAppFrame(stack = ''): string {
   return line !== undefined ? line.trim() : '';
 }
 
+// Hashes the normalized message + first app frame into a short, stable id for this failure.
 function fingerprint(error: PlaywrightError): string {
   const signature = normalizeError(error?.message, firstAppFrame(error?.stack));
   return createHash('sha256').update(signature).digest('hex').slice(0, 12);
@@ -327,12 +348,12 @@ function extractErrorContext(
 
 // ---------- history store ----------
 
-const HISTORY_VERSION = 3;
-
+// Fresh history store, used when there's no cache to restore from (a cold cache).
 function emptyHistory(): HistoryStore {
-  return { version: HISTORY_VERSION, tests: {}, fingerprints: {} };
+  return { tests: {}, fingerprints: {} };
 }
 
+// Reads history.json from disk, falling back to an empty store on a cold cache or bad JSON.
 function loadHistory(historyPath: string): HistoryStore {
   if (!existsSync(historyPath)) {
     console.log(
@@ -340,9 +361,14 @@ function loadHistory(historyPath: string): HistoryStore {
     );
     return emptyHistory();
   }
-  let raw: Partial<HistoryStore> & Record<string, unknown>;
   try {
-    raw = JSON.parse(readFileSync(historyPath, 'utf8'));
+    const raw: Partial<HistoryStore> = JSON.parse(
+      readFileSync(historyPath, 'utf8')
+    );
+    return {
+      tests: raw.tests ?? {},
+      fingerprints: raw.fingerprints ?? {},
+    };
   } catch (err) {
     console.warn(
       `History at ${historyPath} is unreadable (${
@@ -351,27 +377,6 @@ function loadHistory(historyPath: string): HistoryStore {
     );
     return emptyHistory();
   }
-  if (raw?.version === HISTORY_VERSION) {
-    return {
-      version: HISTORY_VERSION,
-      tests: raw.tests ?? {},
-      fingerprints: raw.fingerprints ?? {},
-    };
-  }
-  // v1 shape was a bare map of testKey -> { runs, fixAttempts }.
-  const migrated = emptyHistory();
-  Object.entries(raw ?? {}).forEach(([key, value]) => {
-    const entry = value as { runs?: RunRecord[] } | undefined;
-    if (Array.isArray(entry?.runs)) {
-      migrated.tests[key] = { runs: entry.runs.slice(-HISTORY_WINDOW) };
-    }
-  });
-  console.log(
-    `Migrated ${
-      Object.keys(migrated.tests).length
-    } legacy history entries to v${HISTORY_VERSION}.`
-  );
-  return migrated;
 }
 
 function saveHistory(historyPath: string, history: HistoryStore): void {
@@ -379,6 +384,7 @@ function saveHistory(historyPath: string, history: HistoryStore): void {
   writeFileSync(historyPath, JSON.stringify(history, null, 2));
 }
 
+// Appends this run's outcome to a test's history, trimming to the rolling window.
 function recordRun(
   history: HistoryStore,
   testKey: string,
@@ -391,6 +397,7 @@ function recordRun(
   return entry;
 }
 
+// Gets or lazily creates the persisted state for a fingerprint.
 function fingerprintState(history: HistoryStore, fp: string): FingerprintState {
   history.fingerprints[fp] ??= { fixAttempts: [], cleanRunsSinceClose: 0 };
   return history.fingerprints[fp];
@@ -422,6 +429,7 @@ function groupStats(
 
 // ---------- classification + decision gate ----------
 
+// Labels a fingerprint as new/chronic flake or new/persistent hard failure based on its history.
 function classify(
   status: FailingStatus,
   flakeRate: number,
@@ -438,10 +446,12 @@ function classify(
     : 'new_flake';
 }
 
+// True if any failing test's file matches a configured sensitive-path pattern.
 function isSensitivePath(testFiles: string[]): boolean {
   return testFiles.some(f => SENSITIVE_PATH_PATTERNS.some(re => re.test(f)));
 }
 
+// Routing gate: infra-wide noise -> sensitive path -> repeat failed fixes -> hand to an agent.
 function decide({
   testFiles,
   classification,
@@ -491,6 +501,7 @@ const GUARDRAIL = [
   'counts honestly in the PR. See `AGENTS.md` for the full policy and required PR description format.',
 ].join(' ');
 
+// Caps error/snapshot text length so issue bodies stay within GitHub's size limits.
 function truncate(text: string | undefined, max = 4000): string {
   const s = String(text ?? '');
   return s.length > max ? `${s.slice(0, max)}\n... (truncated)` : s;
@@ -507,6 +518,7 @@ function fenced(text: string | undefined): string {
   return `${fence}\n${body}\n${fence}`;
 }
 
+// Builds the `playwright test` command a human/agent can run to reproduce the failure.
 function reproCommand(bundle: Bundle): string {
   const files = [...new Set(bundle.tests.map(t => t.file))];
   const projects = [
@@ -518,6 +530,7 @@ function reproCommand(bundle: Bundle): string {
   } --repeat-each=10`;
 }
 
+// Renders the full markdown body for a fingerprint's GitHub issue.
 function buildIssueBody(decision: Decision, ctx: RunContext): string {
   const b = decision.bundle;
   const lines: (string | null)[] = [
@@ -530,7 +543,7 @@ function buildIssueBody(decision: Decision, ctx: RunContext): string {
     ...b.tests.map(
       t => `- \`${t.file}\` — ${t.title} _(${t.project || 'default'})_`
     ),
-  ];
+  ]; // lines stores the initial set of markdown lines for the issue body in an array
 
   if (b.tests.length > 1) {
     lines.push(
@@ -601,6 +614,7 @@ function buildIssueBody(decision: Decision, ctx: RunContext): string {
   return lines.filter((l): l is string => l !== null).join('\n');
 }
 
+// Builds a short, deduped issue title from the fingerprint's test titles.
 function buildTitle(bundle: Bundle): string {
   const titles = [...new Set(bundle.tests.map(t => t.title))];
   const shown = titles.slice(0, 2).join(', ');
@@ -608,6 +622,7 @@ function buildTitle(bundle: Bundle): string {
   return `[e2e] ${shown}${extra}`.slice(0, 240);
 }
 
+// Labels applied to a fingerprint's issue based on its classification and route.
 function labelsFor(decision: Decision): string[] {
   return [
     BASE_LABEL,
@@ -618,6 +633,7 @@ function labelsFor(decision: Decision): string[] {
 
 // ---------- GitHub API ----------
 
+// Minimal GitHub REST client authenticated with the given token.
 function makeClient(token: string, repository: string): GithubClient {
   const [owner, repo] = (repository ?? '').split('/');
   const api = 'https://api.github.com';
@@ -627,6 +643,7 @@ function makeClient(token: string, repository: string): GithubClient {
     'X-GitHub-Api-Version': '2022-11-28',
   };
 
+  // Shared fetch wrapper: throws on non-2xx, returns null for 204 responses.
   async function request<T>(
     pathname: string,
     opts: { method?: string; body?: string } = {}
@@ -684,6 +701,7 @@ function makeClient(token: string, repository: string): GithubClient {
 
 // ---------- main ----------
 
+// Parses `--flag value` pairs and the `--dry-run` switch from argv.
 function parseArgs(): CliArgs {
   const args: CliArgs = { dryRun: false };
   const argv = process.argv.slice(2);
@@ -699,6 +717,7 @@ function parseArgs(): CliArgs {
   return args;
 }
 
+// Writes to the GitHub Actions step summary if available, else falls back to stdout.
 function writeSummary(markdown: string): void {
   const summaryPath = process.env.GITHUB_STEP_SUMMARY;
   if (summaryPath !== undefined && summaryPath !== '') {
@@ -708,6 +727,7 @@ function writeSummary(markdown: string): void {
   }
 }
 
+// Entry point: load report + history, classify failures, sync GitHub issues, persist state.
 async function main(): Promise<void> {
   const args = parseArgs();
   if (args.report === undefined || args.report === '') {
@@ -717,11 +737,13 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Load this run's merged Playwright report and the persisted flake history cache.
   const historyPath = args.history ?? '.test-health/history.json';
   const outPath = args.out ?? '.test-health/decisions.json';
   const report: PlaywrightSuite = JSON.parse(readFileSync(args.report, 'utf8'));
   const history = loadHistory(historyPath);
 
+  // Metadata identifying this CI run, embedded in issue bodies and history records.
   const serverUrl = process.env.GITHUB_SERVER_URL ?? 'https://github.com';
   const repository = process.env.GITHUB_REPOSITORY ?? '';
   const runId = process.env.GITHUB_RUN_ID ?? String(Date.now());
@@ -734,6 +756,7 @@ async function main(): Promise<void> {
     timestamp: new Date().toISOString(),
   };
 
+  // No token/repo, or an explicit --dry-run: only write local files, never touch GitHub issues.
   const dryRun =
     args.dryRun ||
     process.env.GITHUB_TOKEN === undefined ||
@@ -746,6 +769,7 @@ async function main(): Promise<void> {
 
   // ---- 1. walk the merged report ----
 
+  // Populated by walk() below.
   const failing: FailingTest[] = [];
   const counts: Record<string, number> = {
     total: 0,
@@ -755,6 +779,7 @@ async function main(): Promise<void> {
     skipped: 0,
   };
 
+  // Recursively flattens the report's suite tree into per-test run records and failures.
   function walk(suite: PlaywrightSuite, titlePath: string[] = []): void {
     (suite.specs ?? []).forEach(spec => {
       // One entry per browser project, not just the first.
@@ -819,6 +844,7 @@ async function main(): Promise<void> {
   }
   walk(report);
 
+  // If a large fraction of the suite failed at once, it's more likely infra than any one flake.
   const broadFailureRatio =
     counts.total > 0 ? failing.length / counts.total : 0;
   console.log(
@@ -829,12 +855,14 @@ async function main(): Promise<void> {
 
   // ---- 2. group by fingerprint and decide ----
 
+  // Group failing tests by fingerprint so a shared root cause gets one issue, not one per test.
   const groups = new Map<string, FailingTest[]>();
   failing.forEach(f => {
     if (!groups.has(f.fp)) groups.set(f.fp, []);
     groups.get(f.fp)?.push(f);
   });
 
+  // Compute flake rate, classification, and routing decision for each fingerprint group.
   const decisions: Decision[] = [...groups.entries()].map(([fp, group]) => {
     const state = fingerprintState(history, fp);
     // Accumulate every test ever seen under this fingerprint, not just tonight's failures --
@@ -882,6 +910,7 @@ async function main(): Promise<void> {
 
   const seenThisRun = new Set(groups.keys());
   if (gh) {
+    // Only fingerprints with a previously opened issue need their GitHub state refreshed.
     const tracked = Object.entries(history.fingerprints)
       .filter(([, s]) => s.issueNumber)
       .sort(([fpA, a], [fpB, b]) => {
@@ -897,6 +926,7 @@ async function main(): Promise<void> {
         );
       })
       .slice(0, MAX_ISSUE_STATE_REFRESHES);
+
     await Promise.all(
       tracked.map(async ([fp, state]) => {
         try {
@@ -957,6 +987,8 @@ async function main(): Promise<void> {
 
   // ---- 4. open or update one issue per fingerprint ----
 
+  // Fall back to matching by the embedded marker if history lost track of an issue number
+  // (e.g. a cold cache), so a fingerprint doesn't get a duplicate issue opened for it.
   const existingByFingerprint = new Map<string, number>();
   if (gh) {
     try {
@@ -976,6 +1008,8 @@ async function main(): Promise<void> {
     }
   }
 
+  // Process fingerprints one at a time (not Promise.all) to avoid racing GitHub issue
+  // creation/updates for fingerprints that happen to resolve to the same issue.
   await decisions.reduce(async (prevPromise, decision) => {
     await prevPromise;
 
@@ -1053,6 +1087,7 @@ async function main(): Promise<void> {
 
   // ---- 5. prune, persist, summarize ----
 
+  // Drop fingerprints untouched for a long time, unless they still have an open issue.
   const cutoff = Date.now() - PRUNE_AFTER_DAYS * 86400_000;
   Object.entries(history.fingerprints).forEach(([fp, state]) => {
     const lastSeen = Date.parse(state.lastSeenAt ?? '') || 0;
@@ -1068,6 +1103,7 @@ async function main(): Promise<void> {
     JSON.stringify({ ...ctx, counts, broadFailureRatio, decisions }, null, 2)
   );
 
+  // Convenience filter for tallying decisions by route in the job summary below.
   const byRoute = (route: Route): Decision[] =>
     decisions.filter(d => d.route === route);
   writeSummary(
