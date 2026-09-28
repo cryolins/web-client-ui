@@ -16,7 +16,7 @@
  * flakeRate/priorFixAttempts simply start empty and rebuild over a few nights.
  *
  * Usage:
- *   node triage-v3.mjs --report ./report.json \
+ *   node nightly-flake-triage.ts --report ./report.json \
  *     --history ./.test-health/history.json \
  *     --out ./.test-health/decisions.json [--dry-run]
  *
@@ -40,6 +40,175 @@ import {
 } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
+
+// ---------- types ----------
+
+type TestStatus = 'expected' | 'unexpected' | 'flaky' | 'skipped';
+type FailingStatus = 'flaky' | 'unexpected';
+type FixOutcome = 'recurred' | 'held';
+type Classification =
+  | 'chronic_flake'
+  | 'new_flake'
+  | 'persistent_failure'
+  | 'new_hard_failure';
+type Route = 'no_action' | 'escalate' | 'auto_fix_candidate';
+
+interface RunContext {
+  runId: string;
+  runUrl: string;
+  reportUrl: string;
+  commit: string;
+  branch: string;
+  timestamp: string;
+}
+
+interface RunRecord extends RunContext {
+  status: TestStatus;
+  durationMs: number;
+}
+
+interface TestHistoryEntry {
+  runs: RunRecord[];
+}
+
+interface FixAttempt {
+  outcome: FixOutcome;
+  issueNumber: number;
+  runId: string;
+  at: string;
+}
+
+interface FingerprintState {
+  fixAttempts: FixAttempt[];
+  cleanRunsSinceClose: number;
+  testKeys?: string[];
+  issueNumber?: number;
+  issueState?: 'open' | 'closed';
+  lastSeenAt?: string;
+  lastSeenRunId?: string;
+  openedAt?: string;
+}
+
+interface HistoryStore {
+  version: number;
+  tests: Record<string, TestHistoryEntry>;
+  fingerprints: Record<string, FingerprintState>;
+}
+
+interface ErrorInfo {
+  message: string;
+  stack: string;
+}
+
+interface TestRef {
+  file: string;
+  title: string;
+  project: string;
+  status: FailingStatus;
+}
+
+interface Bundle {
+  fingerprint: string;
+  status: FailingStatus;
+  classification: Classification;
+  tests: TestRef[];
+  error: ErrorInfo;
+  pageSnapshot: string;
+  flakeRate: number;
+  historyWindow: number;
+  priorFixAttempts: number;
+  traceAttachments: string[];
+}
+
+interface Decision {
+  route: Route;
+  reason: string;
+  bundle: Bundle;
+  rendered?: { title: string; labels: string[]; body: string };
+  issue?: number | null;
+  issueError?: string;
+}
+
+interface FailingTest {
+  testKey: string;
+  file: string;
+  title: string;
+  project: string;
+  status: FailingStatus;
+  fp: string;
+  error: ErrorInfo;
+  pageSnapshot: string;
+  attachments: string[];
+}
+
+// Minimal shape of Playwright's merged JSON reporter output -- only the
+// fields this script reads, not the full public schema.
+interface PlaywrightErrorContext {
+  value?: string;
+  text?: string;
+  body?: string;
+}
+
+interface PlaywrightError {
+  message?: string;
+  stack?: string;
+  errorContext?: string | PlaywrightErrorContext;
+}
+
+interface PlaywrightAttachment {
+  name?: string;
+  path?: string;
+  body?: string;
+}
+
+interface PlaywrightResult {
+  duration?: number;
+  error?: PlaywrightError;
+  attachments?: PlaywrightAttachment[];
+}
+
+interface PlaywrightTest {
+  status: TestStatus;
+  projectName?: string;
+  results?: PlaywrightResult[];
+}
+
+interface PlaywrightSpec {
+  file: string;
+  title: string;
+  tests?: PlaywrightTest[];
+}
+
+interface PlaywrightSuite {
+  title?: string;
+  specs?: PlaywrightSpec[];
+  suites?: PlaywrightSuite[];
+}
+
+interface GithubIssue {
+  number: number;
+  state: 'open' | 'closed';
+  body?: string;
+}
+
+interface GithubClient {
+  getIssue: (number: number) => Promise<GithubIssue>;
+  updateIssue: (
+    number: number,
+    patch: Record<string, unknown>
+  ) => Promise<GithubIssue | null>;
+  comment: (number: number, body: string) => Promise<unknown>;
+  createIssue: (payload: Record<string, unknown>) => Promise<GithubIssue>;
+  openIssuesWithLabel: (label: string) => Promise<GithubIssue[]>;
+}
+
+interface CliArgs {
+  dryRun: boolean;
+  report?: string;
+  history?: string;
+  out?: string;
+  [flag: string]: string | boolean | undefined;
+}
 
 // ---------- config ----------
 
@@ -67,14 +236,15 @@ const SENSITIVE_PATH_PATTERNS = (process.env.SENSITIVE_PATH_PATTERNS ?? '')
 const BASE_LABEL = 'e2e-failure';
 const AGENT_LABEL = 'auto-investigate';
 const HUMAN_LABEL = 'needs-human';
-const CLASSIFICATION_LABELS = {
+const CLASSIFICATION_LABELS: Record<Classification, string> = {
   chronic_flake: 'chronic-flake',
   new_flake: 'new-flake',
   persistent_failure: 'persistent-failure',
   new_hard_failure: 'new-hard-failure',
 };
 
-const MARKER = fp => `<!-- test-health-fingerprint: ${fp} -->`;
+const MARKER = (fp: string): string =>
+  `<!-- test-health-fingerprint: ${fp} -->`;
 
 // ---------- fingerprinting ----------
 
@@ -85,13 +255,13 @@ const MARKER = fp => `<!-- test-health-fingerprint: ${fp} -->`;
 // just from the copy we hash for fingerprinting.
 const ANSI_PATTERN = /\u001b\[[0-9;]*[a-zA-Z]/g;
 
-function stripAnsi(text = '') {
+function stripAnsi(text = ''): string {
   return text.replace(ANSI_PATTERN, '');
 }
 
 // Strip anything that varies run-to-run (ids, line numbers, timestamps) so
 // the same underlying bug hashes to the same fingerprint every time.
-function normalizeError(message = '', stackTop = '') {
+function normalizeError(message = '', stackTop = ''): string {
   return stripAnsi(`${message}\n${stackTop}`)
     .replace(
       /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
@@ -100,26 +270,27 @@ function normalizeError(message = '', stackTop = '') {
     .replace(/:\d+:\d+/g, ':<line>:<col>')
     .replace(/\b\d{10,13}\b/g, '<timestamp>')
     .replace(/\b\d+(\.\d+)?m?s\b/g, '<duration>')
-    .replace(/\b\d+\b/g, '<n>')
+    .replace(/\b\d+\b/g, '<n>') // numbers
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-function firstAppFrame(stack = '') {
+// first application/test-related frame in the stack trace
+function firstAppFrame(stack = ''): string {
   const line = stack
     .split('\n')
     .find(l => l.includes('/tests/') || l.includes('/src/'));
-  return line ? line.trim() : '';
+  return line !== undefined ? line.trim() : '';
 }
 
-function fingerprint(error) {
+function fingerprint(error: PlaywrightError): string {
   const signature = normalizeError(error?.message, firstAppFrame(error?.stack));
   return createHash('sha256').update(signature).digest('hex').slice(0, 12);
 }
 
 // Playwright exposes the page's accessibility snapshot at failure time either on the
 // error itself (1.60+ errorContext) or as an attached markdown file. Try both.
-function readAttachmentContext(a) {
+function readAttachmentContext(a: PlaywrightAttachment): string | undefined {
   if (!/error.?context/i.test(a.name ?? '')) return undefined;
   if (typeof a.body === 'string') {
     try {
@@ -128,7 +299,7 @@ function readAttachmentContext(a) {
       /* not base64-encoded */
     }
   }
-  if (a.path && existsSync(a.path)) {
+  if (a.path !== undefined && existsSync(a.path)) {
     try {
       return readFileSync(a.path, 'utf8');
     } catch {
@@ -138,12 +309,15 @@ function readAttachmentContext(a) {
   return undefined;
 }
 
-function extractErrorContext(error, attachments) {
+function extractErrorContext(
+  error: PlaywrightError | undefined,
+  attachments: PlaywrightAttachment[] | undefined
+): string {
   const direct = error?.errorContext;
-  if (typeof direct === 'string' && direct.trim()) return direct;
-  if (direct && typeof direct === 'object') {
+  if (typeof direct === 'string' && direct.trim().length > 0) return direct;
+  if (direct !== undefined && typeof direct === 'object') {
     const value = direct.value ?? direct.text ?? direct.body;
-    if (typeof value === 'string' && value.trim()) return value;
+    if (typeof value === 'string' && value.trim().length > 0) return value;
   }
   const fromAttachment = (attachments ?? [])
     .map(readAttachmentContext)
@@ -155,23 +329,25 @@ function extractErrorContext(error, attachments) {
 
 const HISTORY_VERSION = 3;
 
-function emptyHistory() {
+function emptyHistory(): HistoryStore {
   return { version: HISTORY_VERSION, tests: {}, fingerprints: {} };
 }
 
-function loadHistory(historyPath) {
+function loadHistory(historyPath: string): HistoryStore {
   if (!existsSync(historyPath)) {
     console.log(
       `No history at ${historyPath} (cold cache) - starting a new store.`
     );
     return emptyHistory();
   }
-  let raw;
+  let raw: Partial<HistoryStore> & Record<string, unknown>;
   try {
     raw = JSON.parse(readFileSync(historyPath, 'utf8'));
   } catch (err) {
     console.warn(
-      `History at ${historyPath} is unreadable (${err.message}) - starting fresh.`
+      `History at ${historyPath} is unreadable (${
+        (err as Error).message
+      }) - starting fresh.`
     );
     return emptyHistory();
   }
@@ -185,8 +361,9 @@ function loadHistory(historyPath) {
   // v1 shape was a bare map of testKey -> { runs, fixAttempts }.
   const migrated = emptyHistory();
   Object.entries(raw ?? {}).forEach(([key, value]) => {
-    if (Array.isArray(value?.runs)) {
-      migrated.tests[key] = { runs: value.runs.slice(-HISTORY_WINDOW) };
+    const entry = value as { runs?: RunRecord[] } | undefined;
+    if (Array.isArray(entry?.runs)) {
+      migrated.tests[key] = { runs: entry.runs.slice(-HISTORY_WINDOW) };
     }
   });
   console.log(
@@ -197,12 +374,16 @@ function loadHistory(historyPath) {
   return migrated;
 }
 
-function saveHistory(historyPath, history) {
+function saveHistory(historyPath: string, history: HistoryStore): void {
   mkdirSync(path.dirname(historyPath), { recursive: true });
   writeFileSync(historyPath, JSON.stringify(history, null, 2));
 }
 
-function recordRun(history, testKey, record) {
+function recordRun(
+  history: HistoryStore,
+  testKey: string,
+  record: RunRecord
+): TestHistoryEntry {
   const entry = history.tests[testKey] ?? { runs: [] };
   entry.runs.push(record);
   entry.runs = entry.runs.slice(-HISTORY_WINDOW);
@@ -210,24 +391,27 @@ function recordRun(history, testKey, record) {
   return entry;
 }
 
-function fingerprintState(history, fp) {
+function fingerprintState(history: HistoryStore, fp: string): FingerprintState {
   history.fingerprints[fp] ??= { fixAttempts: [], cleanRunsSinceClose: 0 };
   return history.fingerprints[fp];
 }
 
-function recurredAttempts(state) {
+function recurredAttempts(state: FingerprintState | undefined): FixAttempt[] {
   return (state?.fixAttempts ?? []).filter(a => a.outcome === 'recurred');
 }
 
 // Aggregate across every test sharing a fingerprint -- one root cause can span
 // several specs and several browser projects.
-function groupStats(history, testKeys) {
+function groupStats(
+  history: HistoryStore,
+  testKeys: string[]
+): { flakeRate: number; historyWindow: number } {
   let runs = 0;
   let bad = 0;
   let window = 0;
   testKeys
     .map(key => history.tests[key])
-    .filter(Boolean)
+    .filter((entry): entry is TestHistoryEntry => Boolean(entry))
     .forEach(entry => {
       runs += entry.runs.length;
       bad += entry.runs.filter(r => r.status !== 'expected').length;
@@ -238,7 +422,11 @@ function groupStats(history, testKeys) {
 
 // ---------- classification + decision gate ----------
 
-function classify(status, flakeRate, historyWindow) {
+function classify(
+  status: FailingStatus,
+  flakeRate: number,
+  historyWindow: number
+): Classification {
   const settled = historyWindow >= MIN_RUNS_FOR_TREND;
   if (status === 'unexpected') {
     return settled && flakeRate >= PERSISTENT_FAILURE_RATE
@@ -250,11 +438,21 @@ function classify(status, flakeRate, historyWindow) {
     : 'new_flake';
 }
 
-function isSensitivePath(testFiles) {
+function isSensitivePath(testFiles: string[]): boolean {
   return testFiles.some(f => SENSITIVE_PATH_PATTERNS.some(re => re.test(f)));
 }
 
-function decide({ testFiles, classification, state, broadFailureRatio }) {
+function decide({
+  testFiles,
+  classification,
+  state,
+  broadFailureRatio,
+}: {
+  testFiles: string[];
+  classification: Classification;
+  state: FingerprintState;
+  broadFailureRatio: number;
+}): { route: Route; reason: string } {
   if (broadFailureRatio > BROAD_FAILURE_RATIO) {
     return { route: 'no_action', reason: 'broad_failure_likely_infra' };
   }
@@ -269,7 +467,7 @@ function decide({ testFiles, classification, state, broadFailureRatio }) {
 
 // ---------- issue body ----------
 
-const GUARDANCE = {
+const GUARDANCE: Record<Classification, string> = {
   chronic_flake:
     'This fingerprint has been failing intermittently for a while, so treat it as a genuine flake: ' +
     'find the race, the brittle selector, or the shared-state collision. Do not paper over it with waits or retries.',
@@ -293,13 +491,13 @@ const GUARDRAIL = [
   'counts honestly in the PR. See `AGENTS.md` for the full policy and required PR description format.',
 ].join(' ');
 
-function truncate(text, max = 4000) {
+function truncate(text: string | undefined, max = 4000): string {
   const s = String(text ?? '');
   return s.length > max ? `${s.slice(0, max)}\n... (truncated)` : s;
 }
 
 // Pick a fence longer than any backtick run in the payload so error text cannot break out.
-function fenced(text) {
+function fenced(text: string | undefined): string {
   const body = truncate(text) || '(none captured)';
   const longest = (body.match(/`+/g) ?? []).reduce(
     (m, s) => Math.max(m, s.length),
@@ -309,7 +507,7 @@ function fenced(text) {
   return `${fence}\n${body}\n${fence}`;
 }
 
-function reproCommand(bundle) {
+function reproCommand(bundle: Bundle): string {
   const files = [...new Set(bundle.tests.map(t => t.file))];
   const projects = [
     ...new Set(bundle.tests.map(t => t.project).filter(Boolean)),
@@ -320,9 +518,9 @@ function reproCommand(bundle) {
   } --repeat-each=10`;
 }
 
-function buildIssueBody(decision, ctx) {
+function buildIssueBody(decision: Decision, ctx: RunContext): string {
   const b = decision.bundle;
-  const lines = [
+  const lines: (string | null)[] = [
     MARKER(b.fingerprint),
     `**Fingerprint:** \`${b.fingerprint}\` · **Classification:** \`${b.classification}\` · **Route:** \`${decision.route}\` (${decision.reason})`,
     `**Flake rate:** ${b.flakeRate} over the last ${b.historyWindow} recorded nightly run(s)`,
@@ -400,17 +598,17 @@ function buildIssueBody(decision, ctx) {
   );
 
   // null marks an omitted line; '' is a deliberate blank line markdown needs.
-  return lines.filter(l => l !== null).join('\n');
+  return lines.filter((l): l is string => l !== null).join('\n');
 }
 
-function buildTitle(bundle) {
+function buildTitle(bundle: Bundle): string {
   const titles = [...new Set(bundle.tests.map(t => t.title))];
   const shown = titles.slice(0, 2).join(', ');
   const extra = titles.length > 2 ? ` +${titles.length - 2} more` : '';
   return `[e2e] ${shown}${extra}`.slice(0, 240);
 }
 
-function labelsFor(decision) {
+function labelsFor(decision: Decision): string[] {
   return [
     BASE_LABEL,
     CLASSIFICATION_LABELS[decision.bundle.classification],
@@ -420,7 +618,7 @@ function labelsFor(decision) {
 
 // ---------- GitHub API ----------
 
-function makeClient(token, repository) {
+function makeClient(token: string, repository: string): GithubClient {
   const [owner, repo] = (repository ?? '').split('/');
   const api = 'https://api.github.com';
   const headers = {
@@ -429,7 +627,10 @@ function makeClient(token, repository) {
     'X-GitHub-Api-Version': '2022-11-28',
   };
 
-  async function request(pathname, opts = {}) {
+  async function request<T>(
+    pathname: string,
+    opts: { method?: string; body?: string } = {}
+  ): Promise<T | null> {
     const res = await fetch(`${api}${pathname}`, { headers, ...opts });
     if (!res.ok) {
       throw new Error(
@@ -438,15 +639,16 @@ function makeClient(token, repository) {
         ).slice(0, 500)}`
       );
     }
-    return res.status === 204 ? null : res.json();
+    return res.status === 204 ? null : ((await res.json()) as T);
   }
 
   return {
-    owner,
-    repo,
-    getIssue: number => request(`/repos/${owner}/${repo}/issues/${number}`),
+    getIssue: number =>
+      request<GithubIssue>(`/repos/${owner}/${repo}/issues/${number}`).then(
+        issue => issue as GithubIssue
+      ),
     updateIssue: (number, patch) =>
-      request(`/repos/${owner}/${repo}/issues/${number}`, {
+      request<GithubIssue>(`/repos/${owner}/${repo}/issues/${number}`, {
         method: 'PATCH',
         body: JSON.stringify(patch),
       }),
@@ -456,17 +658,17 @@ function makeClient(token, repository) {
         body: JSON.stringify({ body }),
       }),
     createIssue: payload =>
-      request(`/repos/${owner}/${repo}/issues`, {
+      request<GithubIssue>(`/repos/${owner}/${repo}/issues`, {
         method: 'POST',
         body: JSON.stringify(payload),
-      }),
-    async openIssuesWithLabel(label) {
-      const all = [];
+      }).then(issue => issue as GithubIssue),
+    async openIssuesWithLabel(label: string): Promise<GithubIssue[]> {
+      const all: GithubIssue[] = [];
       let page = 1;
       let keepGoing = true;
       while (keepGoing && page <= 5) {
         // eslint-disable-next-line no-await-in-loop
-        const batch = await request(
+        const batch = await request<GithubIssue[]>(
           `/repos/${owner}/${repo}/issues?state=open&labels=${encodeURIComponent(
             label
           )}&per_page=100&page=${page}`
@@ -482,8 +684,8 @@ function makeClient(token, repository) {
 
 // ---------- main ----------
 
-function parseArgs() {
-  const args = { dryRun: false };
+function parseArgs(): CliArgs {
+  const args: CliArgs = { dryRun: false };
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
@@ -497,32 +699,33 @@ function parseArgs() {
   return args;
 }
 
-function writeSummary(markdown) {
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown);
+function writeSummary(markdown: string): void {
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  if (summaryPath !== undefined && summaryPath !== '') {
+    appendFileSync(summaryPath, markdown);
   } else {
     console.log(markdown);
   }
 }
 
-async function main() {
+async function main(): Promise<void> {
   const args = parseArgs();
-  if (!args.report) {
+  if (args.report === undefined || args.report === '') {
     console.error(
-      'Usage: node nightly-flake-triage.mjs --report <path> [--history <path>] [--out <path>] [--dry-run]'
+      'Usage: node nightly-flake-triage.ts --report <path> [--history <path>] [--out <path>] [--dry-run]'
     );
     process.exit(1);
   }
 
   const historyPath = args.history ?? '.test-health/history.json';
   const outPath = args.out ?? '.test-health/decisions.json';
-  const report = JSON.parse(readFileSync(args.report, 'utf8'));
+  const report: PlaywrightSuite = JSON.parse(readFileSync(args.report, 'utf8'));
   const history = loadHistory(historyPath);
 
   const serverUrl = process.env.GITHUB_SERVER_URL ?? 'https://github.com';
   const repository = process.env.GITHUB_REPOSITORY ?? '';
   const runId = process.env.GITHUB_RUN_ID ?? String(Date.now());
-  const ctx = {
+  const ctx: RunContext = {
     runId,
     runUrl: `${serverUrl}/${repository}/actions/runs/${runId}`,
     reportUrl: process.env.REPORT_ARTIFACT_URL ?? '',
@@ -531,16 +734,28 @@ async function main() {
     timestamp: new Date().toISOString(),
   };
 
-  const dryRun = args.dryRun || !process.env.GITHUB_TOKEN || !repository;
+  const dryRun =
+    args.dryRun ||
+    process.env.GITHUB_TOKEN === undefined ||
+    process.env.GITHUB_TOKEN === '' ||
+    repository === '';
   if (dryRun) console.log('Dry run: no issues will be created or updated.');
-  const gh = dryRun ? null : makeClient(process.env.GITHUB_TOKEN, repository);
+  const gh = dryRun
+    ? null
+    : makeClient(process.env.GITHUB_TOKEN as string, repository);
 
   // ---- 1. walk the merged report ----
 
-  const failing = [];
-  const counts = { total: 0, expected: 0, flaky: 0, unexpected: 0, skipped: 0 };
+  const failing: FailingTest[] = [];
+  const counts: Record<string, number> = {
+    total: 0,
+    expected: 0,
+    flaky: 0,
+    unexpected: 0,
+    skipped: 0,
+  };
 
-  function walk(suite, titlePath = []) {
+  function walk(suite: PlaywrightSuite, titlePath: string[] = []): void {
     (suite.specs ?? []).forEach(spec => {
       // One entry per browser project, not just the first.
       (spec.tests ?? []).forEach(test => {
@@ -565,7 +780,7 @@ async function main() {
           test.results
             ?.slice()
             .reverse()
-            .find(r => r.error) ?? lastResult;
+            .find(r => r.error !== undefined) ?? lastResult;
 
         recordRun(history, testKey, {
           ...ctx,
@@ -588,13 +803,18 @@ async function main() {
               stack: stripAnsi(error.stack ?? ''),
             },
             pageSnapshot: stripAnsi(extractErrorContext(error, attachments)),
-            attachments: attachments.map(a => a.name ?? a.path).filter(Boolean),
+            attachments: attachments
+              .map(a => a.name ?? a.path)
+              .filter((a): a is string => Boolean(a)),
           });
         }
       });
     });
     (suite.suites ?? []).forEach(child =>
-      walk(child, suite.title ? [...titlePath, suite.title] : titlePath)
+      walk(
+        child,
+        suite.title !== undefined ? [...titlePath, suite.title] : titlePath
+      )
     );
   }
   walk(report);
@@ -609,13 +829,13 @@ async function main() {
 
   // ---- 2. group by fingerprint and decide ----
 
-  const groups = new Map();
+  const groups = new Map<string, FailingTest[]>();
   failing.forEach(f => {
     if (!groups.has(f.fp)) groups.set(f.fp, []);
-    groups.get(f.fp).push(f);
+    groups.get(f.fp)?.push(f);
   });
 
-  const decisions = [...groups.entries()].map(([fp, group]) => {
+  const decisions: Decision[] = [...groups.entries()].map(([fp, group]) => {
     const state = fingerprintState(history, fp);
     // Accumulate every test ever seen under this fingerprint, not just tonight's failures --
     // otherwise a sibling test that shares the root cause but passed tonight contributes
@@ -625,7 +845,7 @@ async function main() {
     ];
     const { flakeRate, historyWindow } = groupStats(history, state.testKeys);
     // 'unexpected' dominates: if any project failed outright, treat the group as a hard failure.
-    const status = group.some(g => g.status === 'unexpected')
+    const status: FailingStatus = group.some(g => g.status === 'unexpected')
       ? 'unexpected'
       : 'flaky';
     const classification = classify(status, flakeRate, historyWindow);
@@ -680,12 +900,13 @@ async function main() {
     await Promise.all(
       tracked.map(async ([fp, state]) => {
         try {
-          const issue = await gh.getIssue(state.issueNumber);
+          const issue = await gh.getIssue(state.issueNumber as number);
           state.issueState = issue.state;
         } catch (err) {
-          // eslint-disable-next-line no-console
           console.warn(
-            `Could not refresh issue #${state.issueNumber} for ${fp}: ${err.message}`
+            `Could not refresh issue #${state.issueNumber} for ${fp}: ${
+              (err as Error).message
+            }`
           );
         }
       })
@@ -693,13 +914,16 @@ async function main() {
   }
 
   Object.entries(history.fingerprints)
-    .filter(([, state]) => state.issueNumber && state.issueState === 'closed')
+    .filter(
+      ([, state]) =>
+        state.issueNumber !== undefined && state.issueState === 'closed'
+    )
     .forEach(([fp, state]) => {
       if (seenThisRun.has(fp)) {
         // The issue was closed as fixed and the same fingerprint came back: the fix did not hold.
         state.fixAttempts.push({
           outcome: 'recurred',
-          issueNumber: state.issueNumber,
+          issueNumber: state.issueNumber as number,
           runId: ctx.runId,
           at: ctx.timestamp,
         });
@@ -710,7 +934,7 @@ async function main() {
         if (state.cleanRunsSinceClose >= HOLD_CONFIRM_RUNS && !alreadyHeld) {
           state.fixAttempts.push({
             outcome: 'held',
-            issueNumber: state.issueNumber,
+            issueNumber: state.issueNumber as number,
             runId: ctx.runId,
             at: ctx.timestamp,
           });
@@ -733,7 +957,7 @@ async function main() {
 
   // ---- 4. open or update one issue per fingerprint ----
 
-  const existingByFingerprint = new Map();
+  const existingByFingerprint = new Map<string, number>();
   if (gh) {
     try {
       const open = await gh.openIssuesWithLabel(BASE_LABEL);
@@ -745,7 +969,9 @@ async function main() {
       });
     } catch (err) {
       console.warn(
-        `Could not list existing issues, relying on cached history only: ${err.message}`
+        `Could not list existing issues, relying on cached history only: ${
+          (err as Error).message
+        }`
       );
     }
   }
@@ -759,7 +985,6 @@ async function main() {
     state.lastSeenRunId = ctx.runId;
 
     if (decision.route === 'no_action') {
-      // eslint-disable-next-line no-console
       console.log(`  [no_action] ${fp} (${decision.reason})`);
       return;
     }
@@ -771,10 +996,9 @@ async function main() {
     decision.rendered = { title: buildTitle(decision.bundle), labels, body };
 
     if (dryRun) {
-      // eslint-disable-next-line no-console
       console.log(
         `  [${decision.route}] ${fp} (${decision.reason}) - would ${
-          issueNumber ? `update #${issueNumber}` : 'open an issue'
+          issueNumber !== undefined ? `update #${issueNumber}` : 'open an issue'
         }`
       );
       decision.issue = issueNumber ?? null;
@@ -782,14 +1006,14 @@ async function main() {
     }
 
     try {
-      if (issueNumber) {
+      if (issueNumber !== undefined) {
         const reopening = state.issueState === 'closed';
-        await gh.updateIssue(issueNumber, {
+        await gh?.updateIssue(issueNumber, {
           body,
           labels,
           ...(reopening ? { state: 'open' } : {}),
         });
-        await gh.comment(
+        await gh?.comment(
           issueNumber,
           reopening
             ? `Recurred after this issue was closed — run ${ctx.runUrl}. Reopening; the previous fix did not hold.`
@@ -798,28 +1022,32 @@ async function main() {
         state.issueState = 'open';
         state.issueNumber = issueNumber;
         decision.issue = issueNumber;
-        // eslint-disable-next-line no-console
         console.log(
           `  [${decision.route}] ${fp} -> ${
             reopening ? 'reopened' : 'updated'
           } #${issueNumber}`
         );
       } else {
-        const created = await gh.createIssue({
+        const created = await gh?.createIssue({
           title: buildTitle(decision.bundle),
           body,
           labels,
         });
-        state.issueNumber = created.number;
-        state.issueState = 'open';
-        state.openedAt = ctx.timestamp;
-        decision.issue = created.number;
-        // eslint-disable-next-line no-console
-        console.log(`  [${decision.route}] ${fp} -> opened #${created.number}`);
+        if (created) {
+          state.issueNumber = created.number;
+          state.issueState = 'open';
+          state.openedAt = ctx.timestamp;
+          decision.issue = created.number;
+          console.log(
+            `  [${decision.route}] ${fp} -> opened #${created.number}`
+          );
+        }
       }
     } catch (err) {
-      console.error(`Failed to sync issue for ${fp}: ${err.message}`);
-      decision.issueError = err.message;
+      console.error(
+        `Failed to sync issue for ${fp}: ${(err as Error).message}`
+      );
+      decision.issueError = (err as Error).message;
     }
   }, Promise.resolve());
 
@@ -840,7 +1068,8 @@ async function main() {
     JSON.stringify({ ...ctx, counts, broadFailureRatio, decisions }, null, 2)
   );
 
-  const byRoute = route => decisions.filter(d => d.route === route);
+  const byRoute = (route: Route): Decision[] =>
+    decisions.filter(d => d.route === route);
   writeSummary(
     `${[
       '### Nightly E2E triage',
@@ -869,7 +1098,7 @@ async function main() {
                   d.bundle.classification
                 } | ${d.bundle.flakeRate} (${d.bundle.historyWindow} runs) | ${
                   d.bundle.tests.length
-                } | ${d.issue ? `#${d.issue}` : '—'} |`
+                } | ${d.issue != null ? `#${d.issue}` : '—'} |`
             ),
           ]
         : []),

@@ -280,7 +280,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPORT_ARTIFACT_URL: ${{ needs.merge-reports.outputs.report-url }}
         run: |
-          node ./tests/nightly-flake-triage.mjs \
+          node ./tests/nightly-flake-triage.ts \
             --report ./report.json \
             --history ./.test-health/history.json \
             --out ./.test-health/decisions.json
