@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* eslint-disable no-console, no-param-reassign, no-control-regex */
 /**
- * Playwright nightly-run triage (v3).
+ * Playwright nightly-run triage.
  *
  * Merges the two earlier prototypes:
  *   - from triage.mjs: normalized SHA-256 fingerprinting, a persisted history
@@ -509,7 +509,7 @@ async function main() {
   const args = parseArgs();
   if (!args.report) {
     console.error(
-      'Usage: node triage-v3.mjs --report <path> [--history <path>] [--out <path>] [--dry-run]'
+      'Usage: node nightly-flake-triage.mjs --report <path> [--history <path>] [--out <path>] [--dry-run]'
     );
     process.exit(1);
   }
