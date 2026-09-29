@@ -498,7 +498,7 @@ const GUARDRAIL = [
   'auto-retrying assertions (`await expect(locator).toBeVisible()`). If you cannot establish a root cause,',
   'quarantine the test with `test.skip` plus a comment linking back to this issue rather than guessing.',
   'Re-run the affected spec(s) at least 10 times before and after (`--repeat-each=10`) and report the',
-  'counts honestly in the PR. See `AGENTS.md` for the full policy and required PR description format.',
+  'counts honestly in the PR. See `.github/instructions/playwright.instructions.md` for the full policy and required PR description format.',
 ].join(' ');
 
 // Caps error/snapshot text length so issue bodies stay within GitHub's size limits.
