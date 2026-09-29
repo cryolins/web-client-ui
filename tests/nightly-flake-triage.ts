@@ -24,6 +24,11 @@
  *      GITHUB_SERVER_URL, GITHUB_SHA, GITHUB_REF_NAME, GITHUB_STEP_SUMMARY.
  * Without GITHUB_TOKEN the script runs in dry-run mode and only writes files.
  *
+ * Optional: COPILOT_ASSIGN_TOKEN enables assigning the top fingerprints to the
+ * Copilot cloud agent. It must be a user-to-server token (PAT or GitHub App
+ * user token) -- the Actions GITHUB_TOKEN is rejected by the assignment API.
+ * Unset, the script still opens and labels issues, just without an assignee.
+ *
  * Schema note: reads Playwright's JSON reporter shape (suites -> specs ->
  * tests -> results, with a resolved `status` of 'expected' | 'unexpected' |
  * 'flaky' | 'skipped'). Generate one real report from your repo and diff it
@@ -136,6 +141,8 @@ interface Decision {
   rendered?: { title: string; labels: string[]; body: string };
   issue?: number | null;
   issueError?: string;
+  assigned?: boolean;
+  assignError?: string;
 }
 
 // One flaky/failed test occurrence extracted from the Playwright report while walking it.
@@ -219,6 +226,8 @@ interface GithubClient {
   comment: (number: number, body: string) => Promise<unknown>;
   createIssue: (payload: Record<string, unknown>) => Promise<GithubIssue>;
   openIssuesWithLabel: (label: string) => Promise<GithubIssue[]>;
+  // null when no user token is configured, since agent assignment requires one.
+  assignAgent: ((number: number) => Promise<unknown>) | null;
 }
 
 // Parsed --flag values from argv; the index signature allows arbitrary passthrough flags.
@@ -245,6 +254,20 @@ const MIN_RUNS_FOR_TREND = Number(process.env.MIN_RUNS_FOR_TREND ?? 5);
 const HOLD_CONFIRM_RUNS = Number(process.env.HOLD_CONFIRM_RUNS ?? 5);
 const PRUNE_AFTER_DAYS = Number(process.env.PRUNE_AFTER_DAYS ?? 60);
 const MAX_ISSUE_STATE_REFRESHES = 50; // bound the API calls spent re-checking tracked issues
+
+// Assigning Copilot requires a user-to-server token; the Actions-provided GITHUB_TOKEN is a
+// server-to-server token and is rejected by the assignment API, so this is a separate secret.
+// Leave it unset to keep the pipeline label-only.
+const COPILOT_ASSIGN_TOKEN = process.env.COPILOT_ASSIGN_TOKEN ?? '';
+const COPILOT_ASSIGNEE = 'copilot-swe-agent[bot]';
+const COPILOT_CUSTOM_AGENT =
+  process.env.COPILOT_CUSTOM_AGENT ?? 'playwright-flake-investigator';
+const COPILOT_BASE_BRANCH = process.env.COPILOT_BASE_BRANCH ?? 'main';
+// Cap how many fingerprints get handed to an agent per run so one bad night can't open a
+// dozen concurrent sessions and PRs.
+const MAX_AGENT_ASSIGNMENTS_PER_RUN = Number(
+  process.env.MAX_AGENT_ASSIGNMENTS_PER_RUN ?? 3
+);
 
 // Failures under these paths always go to a human, never to an agent.
 const SENSITIVE_PATH_PATTERNS = (process.env.SENSITIVE_PATH_PATTERNS ?? '')
@@ -696,6 +719,39 @@ function makeClient(token: string, repository: string): GithubClient {
       }
       return all;
     },
+    assignAgent:
+      COPILOT_ASSIGN_TOKEN === ''
+        ? null
+        : async (number: number) => {
+            // Deliberately not using request(): this one call needs the user token, and
+            // agent_assignment selects which custom agent picks the issue up.
+            const res = await fetch(
+              `${api}/repos/${owner}/${repo}/issues/${number}/assignees`,
+              {
+                method: 'POST',
+                headers: {
+                  ...headers,
+                  Authorization: `Bearer ${COPILOT_ASSIGN_TOKEN}`,
+                },
+                body: JSON.stringify({
+                  assignees: [COPILOT_ASSIGNEE],
+                  agent_assignment: {
+                    target_repo: repository,
+                    base_branch: COPILOT_BASE_BRANCH,
+                    custom_agent: COPILOT_CUSTOM_AGENT,
+                  },
+                }),
+              }
+            );
+            if (!res.ok) {
+              throw new Error(
+                `POST /issues/${number}/assignees -> ${res.status}: ${(
+                  await res.text()
+                ).slice(0, 500)}`
+              );
+            }
+            return res.json();
+          },
   };
 }
 
@@ -987,6 +1043,21 @@ async function main(): Promise<void> {
 
   // ---- 4. open or update one issue per fingerprint ----
 
+  // Rank agent candidates by flake rate so the cap spends its budget on the fingerprints with
+  // the worst track record; ties break toward the one affecting more tests. Only
+  // auto_fix_candidate routes are eligible -- escalate/no_action stay off the agent's plate.
+  const assignable = new Set(
+    decisions
+      .filter(d => d.route === 'auto_fix_candidate')
+      .sort(
+        (a, b) =>
+          b.bundle.flakeRate - a.bundle.flakeRate ||
+          b.bundle.tests.length - a.bundle.tests.length
+      )
+      .slice(0, MAX_AGENT_ASSIGNMENTS_PER_RUN)
+      .map(d => d.bundle.fingerprint)
+  );
+
   // Fall back to matching by the embedded marker if history lost track of an issue number
   // (e.g. a cold cache), so a fingerprint doesn't get a duplicate issue opened for it.
   const existingByFingerprint = new Map<string, number>();
@@ -1028,16 +1099,23 @@ async function main(): Promise<void> {
     const issueNumber = state.issueNumber ?? existingByFingerprint.get(fp);
     // Keep the rendered issue on the decision so a dry run is reviewable.
     decision.rendered = { title: buildTitle(decision.bundle), labels, body };
+    const wantsAgent = assignable.has(fp);
 
     if (dryRun) {
       console.log(
         `  [${decision.route}] ${fp} (${decision.reason}) - would ${
           issueNumber !== undefined ? `update #${issueNumber}` : 'open an issue'
-        }`
+        }${wantsAgent ? ' and assign the agent' : ''}`
       );
       decision.issue = issueNumber ?? null;
+      decision.assigned = wantsAgent;
       return;
     }
+
+    // Only hand the issue to an agent when a fresh session is warranted: a brand-new issue, or
+    // one reopening because a previous fix didn't hold. A still-failing open issue already has
+    // a session or a human looking at it.
+    let shouldAssign = false;
 
     try {
       if (issueNumber !== undefined) {
@@ -1056,6 +1134,7 @@ async function main(): Promise<void> {
         state.issueState = 'open';
         state.issueNumber = issueNumber;
         decision.issue = issueNumber;
+        shouldAssign = wantsAgent && reopening;
         console.log(
           `  [${decision.route}] ${fp} -> ${
             reopening ? 'reopened' : 'updated'
@@ -1072,6 +1151,7 @@ async function main(): Promise<void> {
           state.issueState = 'open';
           state.openedAt = ctx.timestamp;
           decision.issue = created.number;
+          shouldAssign = wantsAgent;
           console.log(
             `  [${decision.route}] ${fp} -> opened #${created.number}`
           );
@@ -1082,6 +1162,27 @@ async function main(): Promise<void> {
         `Failed to sync issue for ${fp}: ${(err as Error).message}`
       );
       decision.issueError = (err as Error).message;
+    }
+
+    if (shouldAssign && decision.issue != null) {
+      if (gh?.assignAgent == null) {
+        console.log(
+          `  [${decision.route}] ${fp} -> #${decision.issue} not assigned (COPILOT_ASSIGN_TOKEN unset)`
+        );
+      } else {
+        try {
+          await gh.assignAgent(decision.issue);
+          decision.assigned = true;
+          console.log(
+            `  [${decision.route}] ${fp} -> assigned ${COPILOT_CUSTOM_AGENT} to #${decision.issue}`
+          );
+        } catch (err) {
+          console.error(
+            `Failed to assign agent for ${fp}: ${(err as Error).message}`
+          );
+          decision.assignError = (err as Error).message;
+        }
+      }
     }
   }, Promise.resolve());
 
@@ -1117,6 +1218,12 @@ async function main(): Promise<void> {
       `- Routed: ${byRoute('auto_fix_candidate').length} to an agent, ${
         byRoute('escalate').length
       } escalated, ${byRoute('no_action').length} suppressed`,
+      `- Agent assignments this run: ${
+        decisions.filter(d => d.assigned === true).length
+      } (cap ${MAX_AGENT_ASSIGNMENTS_PER_RUN}, ranked by flake rate)`,
+      COPILOT_ASSIGN_TOKEN === ''
+        ? '- _`COPILOT_ASSIGN_TOKEN` is unset — issues were labeled but not assigned to an agent._'
+        : null,
       dryRun ? '- _Dry run — no issues were created or updated._' : null,
       broadFailureRatio > BROAD_FAILURE_RATIO
         ? `- ⚠️ ${(broadFailureRatio * 100).toFixed(
