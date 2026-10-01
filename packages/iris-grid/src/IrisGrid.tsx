@@ -1058,9 +1058,17 @@ class IrisGrid extends Component<IrisGridProps, IrisGridState> {
     ) {
       this.updateQuickFilters(quickFilters);
     }
-    const { loadingScrimStartTime, loadingScrimFinishTime } = this;
+    const {
+      loadingScrimStartTime,
+      loadingScrimFinishTime,
+      loadingScrimGeneration,
+    } = this;
     if (loadingScrimStartTime != null && loadingScrimFinishTime != null) {
       window.requestAnimationFrame(() => {
+        if (loadingScrimGeneration !== this.loadingScrimGeneration) {
+          return;
+        }
+
         const now = Date.now();
         const currentTime = now - loadingScrimStartTime;
         const totalTime = loadingScrimFinishTime - loadingScrimStartTime;
@@ -1071,8 +1079,11 @@ class IrisGrid extends Component<IrisGridProps, IrisGridState> {
         }
 
         this.setState(state => {
-          if (state.loadingScrimProgress == null) {
-            log.debug2('Ignoring scrim update because loading cancelled.');
+          if (
+            loadingScrimGeneration !== this.loadingScrimGeneration ||
+            state.loadingScrimProgress == null
+          ) {
+            log.debug2('Ignoring stale scrim update.');
             return null;
           }
 
@@ -1157,6 +1168,9 @@ class IrisGrid extends Component<IrisGridProps, IrisGridState> {
   loadingScrimStartTime?: number;
 
   loadingScrimFinishTime?: number;
+
+  // Invalidates animation frames queued by a previous loading cycle.
+  loadingScrimGeneration = 0;
 
   animationFrame?: number;
 
@@ -2564,6 +2578,7 @@ class IrisGrid extends Component<IrisGridProps, IrisGridState> {
     }
 
     if (this.loadingScrimStartTime == null) {
+      this.loadingScrimGeneration += 1;
       const { minScrimTransitionTime, maxScrimTransitionTime } = theme;
       assertNotNull(minScrimTransitionTime);
       assertNotNull(maxScrimTransitionTime);
@@ -2588,6 +2603,7 @@ class IrisGrid extends Component<IrisGridProps, IrisGridState> {
 
   stopLoading(): void {
     this.showViewportLoading.cancel();
+    this.loadingScrimGeneration += 1;
     this.loadingScrimStartTime = undefined;
     this.loadingScrimFinishTime = undefined;
     this.setState({
