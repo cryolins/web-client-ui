@@ -223,7 +223,7 @@ interface GithubClient {
   ) => Promise<GithubIssue | null>;
   comment: (number: number, body: string) => Promise<unknown>;
   createIssue: (payload: Record<string, unknown>) => Promise<GithubIssue>;
-  fetchIssuesWithLabel: (label: string) => Promise<GithubIssue[]>;
+  fetchOpenIssuesWithLabel: (label: string) => Promise<GithubIssue[]>;
   // null when no user token is configured, since agent assignment requires one.
   assignAgent: ((number: number) => Promise<unknown>) | null;
 }
@@ -744,7 +744,7 @@ function makeClient(token: string, repository: string): GithubClient {
         method: 'POST',
         body: JSON.stringify(payload),
       }).then(issue => issue as GithubIssue),
-    async fetchIssuesWithLabel(label: string): Promise<GithubIssue[]> {
+    async fetchOpenIssuesWithLabel(label: string): Promise<GithubIssue[]> {
       const all: GithubIssue[] = [];
       let page = 1;
       let keepGoing = true;
@@ -890,9 +890,11 @@ async function main(): Promise<void> {
         counts[status] = (counts[status] ?? 0) + 1;
 
         const project = test.projectName ?? '';
+        // Keyed on describe-block ancestry + own title, so moving a test
+        // within its file doesn't silently reset its accumulated flake history.
         const testKey = `${spec.file}::${[...titlePath, spec.title].join(
-          ' > ' // Keyed on describe-block ancestry + own title, so moving a test
-        )}::${project}`; // in its file doesn't silently reset its accumulated flake history.
+          ' > '
+        )}::${project}`;
         const lastResult = test.results?.at(-1);
         // For a 'flaky' test the LAST result is the retry that finally passed and
         // carries no error -- walk backwards for the attempt that actually failed.
@@ -1113,7 +1115,7 @@ async function main(): Promise<void> {
   const existingByFingerprint = new Map<string, number>();
   if (gh) {
     try {
-      const open = await gh.fetchIssuesWithLabel(BASE_LABEL);
+      const open = await gh.fetchOpenIssuesWithLabel(BASE_LABEL);
       open.forEach(issue => {
         const match = issue.body?.match(
           /<!-- test-health-fingerprint: ([0-9a-f]+) -->/
@@ -1254,6 +1256,11 @@ async function main(): Promise<void> {
     if (lastRun < cutoff) {
       delete history.tests[testKey];
     }
+  });
+
+  // Surviving fingerprints accumulate testKeys forever, so drop the ones just pruned above.
+  Object.values(history.fingerprints).forEach(state => {
+    state.testKeys = state.testKeys?.filter(key => key in history.tests);
   });
 
   saveHistory(historyPath, history);
