@@ -3,16 +3,8 @@
 /**
  * Playwright nightly-run triage.
  *
- * Merges the two earlier prototypes:
- *   - from triage.mjs: normalized SHA-256 fingerprinting, a persisted history
- *     store with flake rates and fix-attempt outcomes, and a decision gate
- *     (broad-failure / sensitive-path / escalate-after-N-failed-fixes).
- *   - from triage-playwright-results-2.mjs: actually opening and updating one
- *     GitHub issue per fingerprint, deduped, with the guardrail text embedded
- *     in the issue body, plus a job summary.
- *
  * History is a small rolling-window blob restored/saved by actions/cache, so
- * this needs no push access and no orphan branch. A cold cache is not fatal:
+ * this needs no push access/orphan branch/etc. A cold cache is not fatal:
  * flakeRate/priorFixAttempts simply start empty and rebuild over a few nights.
  *
  * Usage:
@@ -31,9 +23,7 @@
  *
  * Schema note: reads Playwright's JSON reporter shape (suites -> specs ->
  * tests -> results, with a resolved `status` of 'expected' | 'unexpected' |
- * 'flaky' | 'skipped'). Generate one real report from your repo and diff it
- * against walk() before trusting this in CI -- the JSON reporter is not a
- * strictly versioned public API.
+ * 'flaky' | 'skipped').
  */
 
 import {
@@ -77,6 +67,14 @@ interface RunRecord extends RunContext {
 // Rolling window of recent run outcomes for one test key.
 interface TestHistoryEntry {
   runs: RunRecord[];
+}
+
+// History signals for one fingerprint, all derived in a single pass over its tests.
+interface GroupStats {
+  flakeRate: number;
+  historyWindow: number;
+  hardFailureStreak: number;
+  wasFlaky: boolean;
 }
 
 // Whether closing a fingerprint's issue actually fixed it or the failure came back.
@@ -225,7 +223,7 @@ interface GithubClient {
   ) => Promise<GithubIssue | null>;
   comment: (number: number, body: string) => Promise<unknown>;
   createIssue: (payload: Record<string, unknown>) => Promise<GithubIssue>;
-  openIssuesWithLabel: (label: string) => Promise<GithubIssue[]>;
+  fetchIssuesWithLabel: (label: string) => Promise<GithubIssue[]>;
   // null when no user token is configured, since agent assignment requires one.
   assignAgent: ((number: number) => Promise<unknown>) | null;
 }
@@ -245,11 +243,13 @@ const HISTORY_WINDOW = Number(process.env.HISTORY_WINDOW ?? 20);
 const ESCALATE_AFTER_ATTEMPTS = Number(
   process.env.ESCALATE_AFTER_ATTEMPTS ?? 2
 );
+// Ratio of failed tests in a single night that signals a wider failure problem.
 const BROAD_FAILURE_RATIO = Number(process.env.BROAD_FAILURE_RATIO ?? 0.3);
 const CHRONIC_FLAKE_RATE = Number(process.env.CHRONIC_FLAKE_RATE ?? 0.3);
 const PERSISTENT_FAILURE_RATE = Number(
   process.env.PERSISTENT_FAILURE_RATE ?? 0.9
 );
+// Minimum number of runs required to establish a trend as persistent/chronic.
 const MIN_RUNS_FOR_TREND = Number(process.env.MIN_RUNS_FOR_TREND ?? 5);
 // Consecutive outright-failure nights a historically flaky test needs before it's treated as a
 // hard failure instead of just another flake; a test with no flaky history skips this grace period.
@@ -271,7 +271,7 @@ const COPILOT_BASE_BRANCH = process.env.COPILOT_BASE_BRANCH ?? 'main';
 // Cap how many fingerprints get handed to an agent per run so one bad night can't open a
 // dozen concurrent sessions and PRs.
 const MAX_AGENT_ASSIGNMENTS_PER_RUN = Number(
-  process.env.MAX_AGENT_ASSIGNMENTS_PER_RUN ?? 3
+  process.env.MAX_AGENT_ASSIGNMENTS_PER_RUN ?? 6
 );
 
 // Failures under these paths always go to a human, never to an agent.
@@ -363,10 +363,14 @@ function extractErrorContext(
   attachments: PlaywrightAttachment[] | undefined
 ): string {
   const direct = error?.errorContext;
-  if (typeof direct === 'string' && direct.trim().length > 0) return direct;
+  if (typeof direct === 'string' && direct.trim().length > 0) {
+    return direct;
+  }
   if (direct !== undefined && typeof direct === 'object') {
     const value = direct.value ?? direct.text ?? direct.body;
-    if (typeof value === 'string' && value.trim().length > 0) return value;
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return value;
+    }
   }
   const fromAttachment = (attachments ?? [])
     .map(readAttachmentContext)
@@ -437,48 +441,43 @@ function recurredAttempts(state: FingerprintState | undefined): FixAttempt[] {
 
 // Aggregate across every test sharing a fingerprint -- one root cause can span
 // several specs and several browser projects.
-function groupStats(
-  history: HistoryStore,
-  testKeys: string[]
-): { flakeRate: number; historyWindow: number } {
+function groupStats(history: HistoryStore, testKeys: string[]): GroupStats {
   let runs = 0;
   let bad = 0;
   let window = 0;
+  let hardFailureStreak = 0;
+  let wasFlaky = false;
+
   testKeys
     .map(key => history.tests[key])
     .filter((entry): entry is TestHistoryEntry => Boolean(entry))
     .forEach(entry => {
       runs += entry.runs.length;
-      bad += entry.runs.filter(r => r.status !== 'expected').length;
       window = Math.max(window, entry.runs.length);
-    });
-  return { flakeRate: runs ? bad / runs : 0, historyWindow: window };
-}
 
-// True if this fingerprint has ever recorded a 'flaky' run.
-function hasFlakyHistory(history: HistoryStore, testKeys: string[]): boolean {
-  return testKeys
-    .map(key => history.tests[key])
-    .filter((entry): entry is TestHistoryEntry => Boolean(entry))
-    .some(entry => entry.runs.some(r => r.status === 'flaky'));
-}
-
-// Longest run of consecutive outright ('unexpected') failures at the end of any test's history,
-// including tonight's run, since recordRun() already appended it before this is called.
-function hardFailureStreak(history: HistoryStore, testKeys: string[]): number {
-  let longest = 0;
-  testKeys
-    .map(key => history.tests[key])
-    .filter((entry): entry is TestHistoryEntry => Boolean(entry))
-    .forEach(entry => {
-      let streak = 0;
+      // Walk backwards so the trailing 'unexpected' streak ends at the first run that broke
+      // it; tonight's run is already appended by recordRun() before this is called.
+      let trailing = 0;
+      let streakIntact = true;
       for (let i = entry.runs.length - 1; i >= 0; i -= 1) {
-        if (entry.runs[i].status !== 'unexpected') break;
-        streak += 1;
+        const { status } = entry.runs[i];
+        if (status !== 'expected') bad += 1;
+        if (status === 'flaky') wasFlaky = true;
+        if (streakIntact && status === 'unexpected') {
+          trailing += 1;
+        } else {
+          streakIntact = false;
+        }
       }
-      longest = Math.max(longest, streak);
+      hardFailureStreak = Math.max(hardFailureStreak, trailing);
     });
-  return longest;
+
+  return {
+    flakeRate: runs ? bad / runs : 0,
+    historyWindow: window,
+    hardFailureStreak,
+    wasFlaky,
+  };
 }
 
 // ---------- classification + decision gate ----------
@@ -492,6 +491,7 @@ function classify(
   wasFlaky: boolean
 ): Classification {
   const settled = historyWindow >= MIN_RUNS_FOR_TREND;
+
   // A historically flaky test gets the benefit of the doubt: an outright failure only counts as
   // a hard failure once it happens HARD_FAILURE_STREAK_THRESHOLD nights in a row. A test with no
   // flaky history has nothing to give it the benefit of the doubt, so it escalates immediately.
@@ -542,7 +542,7 @@ function decide({
 
 // ---------- issue body ----------
 
-const GUARDANCE: Record<Classification, string> = {
+const CLASSIFICATION_MESSAGES: Record<Classification, string> = {
   chronic_flake:
     'This fingerprint has been failing intermittently for a while, so treat it as a genuine flake: ' +
     'find the race, the brittle selector, or the shared-state collision. Do not paper over it with waits or retries.',
@@ -619,7 +619,7 @@ function buildIssueBody(decision: Decision, ctx: RunContext): string {
 
   lines.push(
     '',
-    `> ${GUARDANCE[b.classification]}`,
+    `> ${CLASSIFICATION_MESSAGES[b.classification]}`,
     '',
     '**Error**',
     fenced(b.error.message),
@@ -744,7 +744,7 @@ function makeClient(token: string, repository: string): GithubClient {
         method: 'POST',
         body: JSON.stringify(payload),
       }).then(issue => issue as GithubIssue),
-    async openIssuesWithLabel(label: string): Promise<GithubIssue[]> {
+    async fetchIssuesWithLabel(label: string): Promise<GithubIssue[]> {
       const all: GithubIssue[] = [];
       let page = 1;
       let keepGoing = true;
@@ -880,7 +880,6 @@ async function main(): Promise<void> {
   // Recursively flattens the report's suite tree into per-test run records and failures.
   function walk(suite: PlaywrightSuite, titlePath: string[] = []): void {
     (suite.specs ?? []).forEach(spec => {
-      // One entry per browser project, not just the first.
       (spec.tests ?? []).forEach(test => {
         const { status } = test; // 'expected' | 'unexpected' | 'flaky' | 'skipped'
         if (status === 'skipped') {
@@ -891,11 +890,9 @@ async function main(): Promise<void> {
         counts[status] = (counts[status] ?? 0) + 1;
 
         const project = test.projectName ?? '';
-        // Keyed on describe-block ancestry + own title rather than line/column, so moving
-        // a test in its file doesn't silently reset its accumulated flake history.
         const testKey = `${spec.file}::${[...titlePath, spec.title].join(
-          ' > '
-        )}::${project}`;
+          ' > ' // Keyed on describe-block ancestry + own title, so moving a test
+        )}::${project}`; // in its file doesn't silently reset its accumulated flake history.
         const lastResult = test.results?.at(-1);
         // For a 'flaky' test the LAST result is the retry that finally passed and
         // carries no error -- walk backwards for the attempt that actually failed.
@@ -969,9 +966,8 @@ async function main(): Promise<void> {
     state.testKeys = [
       ...new Set([...(state.testKeys ?? []), ...group.map(g => g.testKey)]),
     ];
-    const { flakeRate, historyWindow } = groupStats(history, state.testKeys);
-    const streak = hardFailureStreak(history, state.testKeys);
-    const wasFlaky = hasFlakyHistory(history, state.testKeys);
+    const { flakeRate, historyWindow, hardFailureStreak, wasFlaky } =
+      groupStats(history, state.testKeys);
     // 'unexpected' dominates: if any project failed outright, treat the group as a hard failure.
     const status: FailingStatus = group.some(g => g.status === 'unexpected')
       ? 'unexpected'
@@ -980,7 +976,7 @@ async function main(): Promise<void> {
       status,
       flakeRate,
       historyWindow,
-      streak,
+      hardFailureStreak,
       wasFlaky
     );
     const decision = decide({
@@ -1014,6 +1010,8 @@ async function main(): Promise<void> {
 
   // ---- 3. refresh tracked issue state, record held/recurred outcomes ----
 
+  // Re-read open/closed state from GitHub: an issue may have been closed by a human or by an
+  // agent's merged PR since the last run, and the cached history has no way to know that.
   const seenThisRun = new Set(groups.keys());
   if (gh) {
     // Only fingerprints with a previously opened issue need their GitHub state refreshed.
@@ -1049,6 +1047,8 @@ async function main(): Promise<void> {
     );
   }
 
+  // Judge the previous fix for every fingerprint whose issue was closed: it recurred if the
+  // failure is back tonight, or held once HOLD_CONFIRM_RUNS clean runs have passed since.
   Object.entries(history.fingerprints)
     .filter(
       ([, state]) =>
@@ -1113,7 +1113,7 @@ async function main(): Promise<void> {
   const existingByFingerprint = new Map<string, number>();
   if (gh) {
     try {
-      const open = await gh.openIssuesWithLabel(BASE_LABEL);
+      const open = await gh.fetchIssuesWithLabel(BASE_LABEL);
       open.forEach(issue => {
         const match = issue.body?.match(
           /<!-- test-health-fingerprint: ([0-9a-f]+) -->/
@@ -1244,6 +1244,15 @@ async function main(): Promise<void> {
     const lastSeen = Date.parse(state.lastSeenAt ?? '') || 0;
     if (lastSeen < cutoff && state.issueState !== 'open') {
       delete history.fingerprints[fp];
+    }
+  });
+
+  // Drop test keys that have stopped reporting entirely -- deleted or renamed tests would
+  // otherwise keep their entries in the cache forever, since nothing ever appends to them again.
+  Object.entries(history.tests).forEach(([testKey, entry]) => {
+    const lastRun = Date.parse(entry.runs.at(-1)?.timestamp ?? '') || 0;
+    if (lastRun < cutoff) {
+      delete history.tests[testKey];
     }
   });
 
