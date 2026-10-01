@@ -251,6 +251,11 @@ const PERSISTENT_FAILURE_RATE = Number(
   process.env.PERSISTENT_FAILURE_RATE ?? 0.9
 );
 const MIN_RUNS_FOR_TREND = Number(process.env.MIN_RUNS_FOR_TREND ?? 5);
+// Consecutive outright-failure nights a historically flaky test needs before it's treated as a
+// hard failure instead of just another flake; a test with no flaky history skips this grace period.
+const HARD_FAILURE_STREAK_THRESHOLD = Number(
+  process.env.HARD_FAILURE_STREAK_THRESHOLD ?? 2
+);
 const HOLD_CONFIRM_RUNS = Number(process.env.HOLD_CONFIRM_RUNS ?? 5);
 const PRUNE_AFTER_DAYS = Number(process.env.PRUNE_AFTER_DAYS ?? 60);
 const MAX_ISSUE_STATE_REFRESHES = 50; // bound the API calls spent re-checking tracked issues
@@ -450,16 +455,53 @@ function groupStats(
   return { flakeRate: runs ? bad / runs : 0, historyWindow: window };
 }
 
+// True if this fingerprint has ever recorded a 'flaky' run.
+function hasFlakyHistory(history: HistoryStore, testKeys: string[]): boolean {
+  return testKeys
+    .map(key => history.tests[key])
+    .filter((entry): entry is TestHistoryEntry => Boolean(entry))
+    .some(entry => entry.runs.some(r => r.status === 'flaky'));
+}
+
+// Longest run of consecutive outright ('unexpected') failures at the end of any test's history,
+// including tonight's run, since recordRun() already appended it before this is called.
+function hardFailureStreak(history: HistoryStore, testKeys: string[]): number {
+  let longest = 0;
+  testKeys
+    .map(key => history.tests[key])
+    .filter((entry): entry is TestHistoryEntry => Boolean(entry))
+    .forEach(entry => {
+      let streak = 0;
+      for (let i = entry.runs.length - 1; i >= 0; i -= 1) {
+        if (entry.runs[i].status !== 'unexpected') break;
+        streak += 1;
+      }
+      longest = Math.max(longest, streak);
+    });
+  return longest;
+}
+
 // ---------- classification + decision gate ----------
 
 // Labels a fingerprint as new/chronic flake or new/persistent hard failure based on its history.
 function classify(
   status: FailingStatus,
   flakeRate: number,
-  historyWindow: number
+  historyWindow: number,
+  streak: number,
+  wasFlaky: boolean
 ): Classification {
   const settled = historyWindow >= MIN_RUNS_FOR_TREND;
-  if (status === 'unexpected') {
+  // A historically flaky test gets the benefit of the doubt: an outright failure only counts as
+  // a hard failure once it happens HARD_FAILURE_STREAK_THRESHOLD nights in a row. A test with no
+  // flaky history has nothing to give it the benefit of the doubt, so it escalates immediately.
+  const effectiveStatus: FailingStatus =
+    status === 'unexpected' &&
+    wasFlaky &&
+    streak < HARD_FAILURE_STREAK_THRESHOLD
+      ? 'flaky'
+      : status;
+  if (effectiveStatus === 'unexpected') {
     return settled && flakeRate >= PERSISTENT_FAILURE_RATE
       ? 'persistent_failure'
       : 'new_hard_failure';
@@ -928,11 +970,19 @@ async function main(): Promise<void> {
       ...new Set([...(state.testKeys ?? []), ...group.map(g => g.testKey)]),
     ];
     const { flakeRate, historyWindow } = groupStats(history, state.testKeys);
+    const streak = hardFailureStreak(history, state.testKeys);
+    const wasFlaky = hasFlakyHistory(history, state.testKeys);
     // 'unexpected' dominates: if any project failed outright, treat the group as a hard failure.
     const status: FailingStatus = group.some(g => g.status === 'unexpected')
       ? 'unexpected'
       : 'flaky';
-    const classification = classify(status, flakeRate, historyWindow);
+    const classification = classify(
+      status,
+      flakeRate,
+      historyWindow,
+      streak,
+      wasFlaky
+    );
     const decision = decide({
       testFiles: [...new Set(group.map(g => g.file))],
       classification,
