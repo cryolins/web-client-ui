@@ -78,6 +78,56 @@ it('renders without crashing', () => {
   makeComponent();
 });
 
+describe('loading scrim animation', () => {
+  it('ignores a queued frame from a previous loading cycle', () => {
+    const component = makeComponent();
+    const frameCallbacks: FrameRequestCallback[] = [];
+    const requestAnimationFrame = jest
+      .spyOn(window, 'requestAnimationFrame')
+      .mockImplementation(callback => {
+        frameCallbacks.push(callback);
+        return frameCallbacks.length;
+      });
+    const now = jest.spyOn(Date, 'now').mockReturnValue(100);
+    jest
+      .spyOn(component, 'sendStateChange')
+      .mockImplementation(() => undefined);
+
+    try {
+      Object.assign(component.state, { loadingScrimProgress: 0 });
+      component.loadingScrimStartTime = 0;
+      component.loadingScrimFinishTime = 250;
+      component.componentDidUpdate(component.props, component.state);
+      const staleFrame = frameCallbacks[0];
+
+      if (staleFrame == null) {
+        throw new Error('Loading scrim frame was not scheduled');
+      }
+
+      act(() => {
+        component.stopLoading();
+      });
+      act(() => {
+        component.startLoading('Filtering again');
+      });
+
+      expect(component.state.loadingScrimProgress).toBe(0);
+
+      now.mockReturnValue(150);
+      act(() => {
+        staleFrame(150);
+      });
+      expect(component.state.loadingScrimProgress).toBe(0);
+    } finally {
+      act(() => {
+        component.stopLoading();
+      });
+      requestAnimationFrame.mockRestore();
+      now.mockRestore();
+    }
+  });
+});
+
 describe('canRollback', () => {
   it('returns true when lastLoadedConfig is set', () => {
     const component = makeComponent();
