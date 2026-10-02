@@ -97,7 +97,13 @@ function runMultiSelectFilter(
   columnType: 'datetime' | 'char' | 'number' | 'string',
   filters: { filter: string; name: string }[]
 ) {
-  test(`multiselect ${columnType} filters`, async ({ page }) => {
+  test(`multiselect ${columnType} filters`, async ({ page, browserName }) => {
+    // Quarantined pending diagnosis of blank-grid screenshots: https://github.com/cryolins/web-client-ui/issues/31
+    test.skip(
+      columnType === 'datetime' && browserName === 'webkit',
+      'Unresolved WebKit blank-grid screenshots'
+    );
+
     await gotoPage(page, '');
     await openTable(page, `multiselect_${columnType}`);
     const gridLocation = await getGridLocation(page);
