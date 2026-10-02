@@ -278,6 +278,9 @@ jobs:
       - name: Triage failures
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Assigning Copilot needs a user-to-server token; GITHUB_TOKEN is rejected.
+          # Unset this secret to keep triage label-only.
+          COPILOT_ASSIGN_TOKEN: ${{ secrets.COPILOT_ASSIGN_TOKEN }}
           REPORT_ARTIFACT_URL: ${{ needs.merge-reports.outputs.report-url }}
         run: |
           node ./tests/nightly-flake-triage.ts \

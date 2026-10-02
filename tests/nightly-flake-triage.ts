@@ -3,16 +3,8 @@
 /**
  * Playwright nightly-run triage.
  *
- * Merges the two earlier prototypes:
- *   - from triage.mjs: normalized SHA-256 fingerprinting, a persisted history
- *     store with flake rates and fix-attempt outcomes, and a decision gate
- *     (broad-failure / sensitive-path / escalate-after-N-failed-fixes).
- *   - from triage-playwright-results-2.mjs: actually opening and updating one
- *     GitHub issue per fingerprint, deduped, with the guardrail text embedded
- *     in the issue body, plus a job summary.
- *
  * History is a small rolling-window blob restored/saved by actions/cache, so
- * this needs no push access and no orphan branch. A cold cache is not fatal:
+ * this needs no push access/orphan branch/etc. A cold cache is not fatal:
  * flakeRate/priorFixAttempts simply start empty and rebuild over a few nights.
  *
  * Usage:
@@ -24,11 +16,14 @@
  *      GITHUB_SERVER_URL, GITHUB_SHA, GITHUB_REF_NAME, GITHUB_STEP_SUMMARY.
  * Without GITHUB_TOKEN the script runs in dry-run mode and only writes files.
  *
+ * Optional: COPILOT_ASSIGN_TOKEN enables assigning the top fingerprints to the
+ * Copilot cloud agent. It must be a user-to-server token (PAT or GitHub App
+ * user token) -- the Actions GITHUB_TOKEN is rejected by the assignment API.
+ * Unset, the script still opens and labels issues, just without an assignee.
+ *
  * Schema note: reads Playwright's JSON reporter shape (suites -> specs ->
  * tests -> results, with a resolved `status` of 'expected' | 'unexpected' |
- * 'flaky' | 'skipped'). Generate one real report from your repo and diff it
- * against walk() before trusting this in CI -- the JSON reporter is not a
- * strictly versioned public API.
+ * 'flaky' | 'skipped').
  */
 
 import {
@@ -72,6 +67,14 @@ interface RunRecord extends RunContext {
 // Rolling window of recent run outcomes for one test key.
 interface TestHistoryEntry {
   runs: RunRecord[];
+}
+
+// History signals for one fingerprint, all derived in a single pass over its tests.
+interface GroupStats {
+  flakeRate: number;
+  historyWindow: number;
+  hardFailureStreak: number;
+  wasFlaky: boolean;
 }
 
 // Whether closing a fingerprint's issue actually fixed it or the failure came back.
@@ -136,6 +139,8 @@ interface Decision {
   rendered?: { title: string; labels: string[]; body: string };
   issue?: number | null;
   issueError?: string;
+  assigned?: boolean;
+  assignError?: string;
 }
 
 // One flaky/failed test occurrence extracted from the Playwright report while walking it.
@@ -218,7 +223,9 @@ interface GithubClient {
   ) => Promise<GithubIssue | null>;
   comment: (number: number, body: string) => Promise<unknown>;
   createIssue: (payload: Record<string, unknown>) => Promise<GithubIssue>;
-  openIssuesWithLabel: (label: string) => Promise<GithubIssue[]>;
+  fetchOpenIssuesWithLabel: (label: string) => Promise<GithubIssue[]>;
+  // null when no user token is configured, since agent assignment requires one.
+  assignAgent: ((number: number) => Promise<unknown>) | null;
 }
 
 // Parsed --flag values from argv; the index signature allows arbitrary passthrough flags.
@@ -236,15 +243,36 @@ const HISTORY_WINDOW = Number(process.env.HISTORY_WINDOW ?? 20);
 const ESCALATE_AFTER_ATTEMPTS = Number(
   process.env.ESCALATE_AFTER_ATTEMPTS ?? 2
 );
+// Ratio of failed tests in a single night that signals a wider failure problem.
 const BROAD_FAILURE_RATIO = Number(process.env.BROAD_FAILURE_RATIO ?? 0.3);
 const CHRONIC_FLAKE_RATE = Number(process.env.CHRONIC_FLAKE_RATE ?? 0.3);
 const PERSISTENT_FAILURE_RATE = Number(
   process.env.PERSISTENT_FAILURE_RATE ?? 0.9
 );
+// Minimum number of runs required to establish a trend as persistent/chronic.
 const MIN_RUNS_FOR_TREND = Number(process.env.MIN_RUNS_FOR_TREND ?? 5);
+// Consecutive outright-failure nights a historically flaky test needs before it's treated as a
+// hard failure instead of just another flake; a test with no flaky history skips this grace period.
+const HARD_FAILURE_STREAK_THRESHOLD = Number(
+  process.env.HARD_FAILURE_STREAK_THRESHOLD ?? 2
+);
 const HOLD_CONFIRM_RUNS = Number(process.env.HOLD_CONFIRM_RUNS ?? 5);
 const PRUNE_AFTER_DAYS = Number(process.env.PRUNE_AFTER_DAYS ?? 60);
 const MAX_ISSUE_STATE_REFRESHES = 50; // bound the API calls spent re-checking tracked issues
+
+// Assigning Copilot requires a user-to-server token; the Actions-provided GITHUB_TOKEN is a
+// server-to-server token and is rejected by the assignment API, so this is a separate secret.
+// Leave it unset to keep the pipeline label-only.
+const COPILOT_ASSIGN_TOKEN = process.env.COPILOT_ASSIGN_TOKEN ?? '';
+const COPILOT_ASSIGNEE = 'copilot-swe-agent[bot]';
+const COPILOT_CUSTOM_AGENT =
+  process.env.COPILOT_CUSTOM_AGENT ?? 'playwright-flake-investigator';
+const COPILOT_BASE_BRANCH = process.env.COPILOT_BASE_BRANCH ?? 'main';
+// Cap how many fingerprints get handed to an agent per run so one bad night can't open a
+// dozen concurrent sessions and PRs.
+const MAX_AGENT_ASSIGNMENTS_PER_RUN = Number(
+  process.env.MAX_AGENT_ASSIGNMENTS_PER_RUN ?? 2
+);
 
 // Failures under these paths always go to a human, never to an agent.
 const SENSITIVE_PATH_PATTERNS = (process.env.SENSITIVE_PATH_PATTERNS ?? '')
@@ -335,10 +363,14 @@ function extractErrorContext(
   attachments: PlaywrightAttachment[] | undefined
 ): string {
   const direct = error?.errorContext;
-  if (typeof direct === 'string' && direct.trim().length > 0) return direct;
+  if (typeof direct === 'string' && direct.trim().length > 0) {
+    return direct;
+  }
   if (direct !== undefined && typeof direct === 'object') {
     const value = direct.value ?? direct.text ?? direct.body;
-    if (typeof value === 'string' && value.trim().length > 0) return value;
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return value;
+    }
   }
   const fromAttachment = (attachments ?? [])
     .map(readAttachmentContext)
@@ -409,22 +441,43 @@ function recurredAttempts(state: FingerprintState | undefined): FixAttempt[] {
 
 // Aggregate across every test sharing a fingerprint -- one root cause can span
 // several specs and several browser projects.
-function groupStats(
-  history: HistoryStore,
-  testKeys: string[]
-): { flakeRate: number; historyWindow: number } {
+function groupStats(history: HistoryStore, testKeys: string[]): GroupStats {
   let runs = 0;
   let bad = 0;
   let window = 0;
+  let hardFailureStreak = 0;
+  let wasFlaky = false;
+
   testKeys
     .map(key => history.tests[key])
     .filter((entry): entry is TestHistoryEntry => Boolean(entry))
     .forEach(entry => {
       runs += entry.runs.length;
-      bad += entry.runs.filter(r => r.status !== 'expected').length;
       window = Math.max(window, entry.runs.length);
+
+      // Walk backwards so the trailing 'unexpected' streak ends at the first run that broke
+      // it; tonight's run is already appended by recordRun() before this is called.
+      let trailing = 0;
+      let streakIntact = true;
+      for (let i = entry.runs.length - 1; i >= 0; i -= 1) {
+        const { status } = entry.runs[i];
+        if (status !== 'expected') bad += 1;
+        if (status === 'flaky') wasFlaky = true;
+        if (streakIntact && status === 'unexpected') {
+          trailing += 1;
+        } else {
+          streakIntact = false;
+        }
+      }
+      hardFailureStreak = Math.max(hardFailureStreak, trailing);
     });
-  return { flakeRate: runs ? bad / runs : 0, historyWindow: window };
+
+  return {
+    flakeRate: runs ? bad / runs : 0,
+    historyWindow: window,
+    hardFailureStreak,
+    wasFlaky,
+  };
 }
 
 // ---------- classification + decision gate ----------
@@ -433,10 +486,22 @@ function groupStats(
 function classify(
   status: FailingStatus,
   flakeRate: number,
-  historyWindow: number
+  historyWindow: number,
+  streak: number,
+  wasFlaky: boolean
 ): Classification {
   const settled = historyWindow >= MIN_RUNS_FOR_TREND;
-  if (status === 'unexpected') {
+
+  // A historically flaky test gets the benefit of the doubt: an outright failure only counts as
+  // a hard failure once it happens HARD_FAILURE_STREAK_THRESHOLD nights in a row. A test with no
+  // flaky history has nothing to give it the benefit of the doubt, so it escalates immediately.
+  const effectiveStatus: FailingStatus =
+    status === 'unexpected' &&
+    wasFlaky &&
+    streak < HARD_FAILURE_STREAK_THRESHOLD
+      ? 'flaky'
+      : status;
+  if (effectiveStatus === 'unexpected') {
     return settled && flakeRate >= PERSISTENT_FAILURE_RATE
       ? 'persistent_failure'
       : 'new_hard_failure';
@@ -477,7 +542,7 @@ function decide({
 
 // ---------- issue body ----------
 
-const GUARDANCE: Record<Classification, string> = {
+const CLASSIFICATION_MESSAGES: Record<Classification, string> = {
   chronic_flake:
     'This fingerprint has been failing intermittently for a while, so treat it as a genuine flake: ' +
     'find the race, the brittle selector, or the shared-state collision. Do not paper over it with waits or retries.',
@@ -554,7 +619,7 @@ function buildIssueBody(decision: Decision, ctx: RunContext): string {
 
   lines.push(
     '',
-    `> ${GUARDANCE[b.classification]}`,
+    `> ${CLASSIFICATION_MESSAGES[b.classification]}`,
     '',
     '**Error**',
     fenced(b.error.message),
@@ -679,7 +744,7 @@ function makeClient(token: string, repository: string): GithubClient {
         method: 'POST',
         body: JSON.stringify(payload),
       }).then(issue => issue as GithubIssue),
-    async openIssuesWithLabel(label: string): Promise<GithubIssue[]> {
+    async fetchOpenIssuesWithLabel(label: string): Promise<GithubIssue[]> {
       const all: GithubIssue[] = [];
       let page = 1;
       let keepGoing = true;
@@ -696,6 +761,39 @@ function makeClient(token: string, repository: string): GithubClient {
       }
       return all;
     },
+    assignAgent:
+      COPILOT_ASSIGN_TOKEN === ''
+        ? null
+        : async (number: number) => {
+            // Deliberately not using request(): this one call needs the user token, and
+            // agent_assignment selects which custom agent picks the issue up.
+            const res = await fetch(
+              `${api}/repos/${owner}/${repo}/issues/${number}/assignees`,
+              {
+                method: 'POST',
+                headers: {
+                  ...headers,
+                  Authorization: `Bearer ${COPILOT_ASSIGN_TOKEN}`,
+                },
+                body: JSON.stringify({
+                  assignees: [COPILOT_ASSIGNEE],
+                  agent_assignment: {
+                    target_repo: repository,
+                    base_branch: COPILOT_BASE_BRANCH,
+                    custom_agent: COPILOT_CUSTOM_AGENT,
+                  },
+                }),
+              }
+            );
+            if (!res.ok) {
+              throw new Error(
+                `POST /issues/${number}/assignees -> ${res.status}: ${(
+                  await res.text()
+                ).slice(0, 500)}`
+              );
+            }
+            return res.json();
+          },
   };
 }
 
@@ -782,7 +880,6 @@ async function main(): Promise<void> {
   // Recursively flattens the report's suite tree into per-test run records and failures.
   function walk(suite: PlaywrightSuite, titlePath: string[] = []): void {
     (suite.specs ?? []).forEach(spec => {
-      // One entry per browser project, not just the first.
       (spec.tests ?? []).forEach(test => {
         const { status } = test; // 'expected' | 'unexpected' | 'flaky' | 'skipped'
         if (status === 'skipped') {
@@ -793,8 +890,8 @@ async function main(): Promise<void> {
         counts[status] = (counts[status] ?? 0) + 1;
 
         const project = test.projectName ?? '';
-        // Keyed on describe-block ancestry + own title rather than line/column, so moving
-        // a test in its file doesn't silently reset its accumulated flake history.
+        // Keyed on describe-block ancestry + own title, so moving a test
+        // within its file doesn't silently reset its accumulated flake history.
         const testKey = `${spec.file}::${[...titlePath, spec.title].join(
           ' > '
         )}::${project}`;
@@ -871,12 +968,19 @@ async function main(): Promise<void> {
     state.testKeys = [
       ...new Set([...(state.testKeys ?? []), ...group.map(g => g.testKey)]),
     ];
-    const { flakeRate, historyWindow } = groupStats(history, state.testKeys);
+    const { flakeRate, historyWindow, hardFailureStreak, wasFlaky } =
+      groupStats(history, state.testKeys);
     // 'unexpected' dominates: if any project failed outright, treat the group as a hard failure.
     const status: FailingStatus = group.some(g => g.status === 'unexpected')
       ? 'unexpected'
       : 'flaky';
-    const classification = classify(status, flakeRate, historyWindow);
+    const classification = classify(
+      status,
+      flakeRate,
+      historyWindow,
+      hardFailureStreak,
+      wasFlaky
+    );
     const decision = decide({
       testFiles: [...new Set(group.map(g => g.file))],
       classification,
@@ -908,6 +1012,8 @@ async function main(): Promise<void> {
 
   // ---- 3. refresh tracked issue state, record held/recurred outcomes ----
 
+  // Re-read open/closed state from GitHub: an issue may have been closed by a human or by an
+  // agent's merged PR since the last run, and the cached history has no way to know that.
   const seenThisRun = new Set(groups.keys());
   if (gh) {
     // Only fingerprints with a previously opened issue need their GitHub state refreshed.
@@ -943,6 +1049,8 @@ async function main(): Promise<void> {
     );
   }
 
+  // Judge the previous fix for every fingerprint whose issue was closed: it recurred if the
+  // failure is back tonight, or held once HOLD_CONFIRM_RUNS clean runs have passed since.
   Object.entries(history.fingerprints)
     .filter(
       ([, state]) =>
@@ -987,12 +1095,27 @@ async function main(): Promise<void> {
 
   // ---- 4. open or update one issue per fingerprint ----
 
+  // Rank agent candidates by flake rate so the cap spends its budget on the fingerprints with
+  // the worst track record; ties break toward the one affecting more tests. Only
+  // auto_fix_candidate routes are eligible -- escalate/no_action stay off the agent's plate.
+  const assignable = new Set(
+    decisions
+      .filter(d => d.route === 'auto_fix_candidate')
+      .sort(
+        (a, b) =>
+          b.bundle.flakeRate - a.bundle.flakeRate ||
+          b.bundle.tests.length - a.bundle.tests.length
+      )
+      .slice(0, MAX_AGENT_ASSIGNMENTS_PER_RUN)
+      .map(d => d.bundle.fingerprint)
+  );
+
   // Fall back to matching by the embedded marker if history lost track of an issue number
   // (e.g. a cold cache), so a fingerprint doesn't get a duplicate issue opened for it.
   const existingByFingerprint = new Map<string, number>();
   if (gh) {
     try {
-      const open = await gh.openIssuesWithLabel(BASE_LABEL);
+      const open = await gh.fetchOpenIssuesWithLabel(BASE_LABEL);
       open.forEach(issue => {
         const match = issue.body?.match(
           /<!-- test-health-fingerprint: ([0-9a-f]+) -->/
@@ -1028,16 +1151,23 @@ async function main(): Promise<void> {
     const issueNumber = state.issueNumber ?? existingByFingerprint.get(fp);
     // Keep the rendered issue on the decision so a dry run is reviewable.
     decision.rendered = { title: buildTitle(decision.bundle), labels, body };
+    const wantsAgent = assignable.has(fp);
 
     if (dryRun) {
       console.log(
         `  [${decision.route}] ${fp} (${decision.reason}) - would ${
           issueNumber !== undefined ? `update #${issueNumber}` : 'open an issue'
-        }`
+        }${wantsAgent ? ' and assign the agent' : ''}`
       );
       decision.issue = issueNumber ?? null;
+      decision.assigned = wantsAgent;
       return;
     }
+
+    // Only hand the issue to an agent when a fresh session is warranted: a brand-new issue, or
+    // one reopening because a previous fix didn't hold. A still-failing open issue already has
+    // a session or a human looking at it.
+    let shouldAssign = false;
 
     try {
       if (issueNumber !== undefined) {
@@ -1056,6 +1186,7 @@ async function main(): Promise<void> {
         state.issueState = 'open';
         state.issueNumber = issueNumber;
         decision.issue = issueNumber;
+        shouldAssign = wantsAgent && reopening;
         console.log(
           `  [${decision.route}] ${fp} -> ${
             reopening ? 'reopened' : 'updated'
@@ -1072,6 +1203,7 @@ async function main(): Promise<void> {
           state.issueState = 'open';
           state.openedAt = ctx.timestamp;
           decision.issue = created.number;
+          shouldAssign = wantsAgent;
           console.log(
             `  [${decision.route}] ${fp} -> opened #${created.number}`
           );
@@ -1082,6 +1214,27 @@ async function main(): Promise<void> {
         `Failed to sync issue for ${fp}: ${(err as Error).message}`
       );
       decision.issueError = (err as Error).message;
+    }
+
+    if (shouldAssign && decision.issue != null) {
+      if (gh?.assignAgent == null) {
+        console.log(
+          `  [${decision.route}] ${fp} -> #${decision.issue} not assigned (COPILOT_ASSIGN_TOKEN unset)`
+        );
+      } else {
+        try {
+          await gh.assignAgent(decision.issue);
+          decision.assigned = true;
+          console.log(
+            `  [${decision.route}] ${fp} -> assigned ${COPILOT_CUSTOM_AGENT} to #${decision.issue}`
+          );
+        } catch (err) {
+          console.error(
+            `Failed to assign agent for ${fp}: ${(err as Error).message}`
+          );
+          decision.assignError = (err as Error).message;
+        }
+      }
     }
   }, Promise.resolve());
 
@@ -1094,6 +1247,20 @@ async function main(): Promise<void> {
     if (lastSeen < cutoff && state.issueState !== 'open') {
       delete history.fingerprints[fp];
     }
+  });
+
+  // Drop test keys that have stopped reporting entirely -- deleted or renamed tests would
+  // otherwise keep their entries in the cache forever, since nothing ever appends to them again.
+  Object.entries(history.tests).forEach(([testKey, entry]) => {
+    const lastRun = Date.parse(entry.runs.at(-1)?.timestamp ?? '') || 0;
+    if (lastRun < cutoff) {
+      delete history.tests[testKey];
+    }
+  });
+
+  // Surviving fingerprints accumulate testKeys forever, so drop the ones just pruned above.
+  Object.values(history.fingerprints).forEach(state => {
+    state.testKeys = state.testKeys?.filter(key => key in history.tests);
   });
 
   saveHistory(historyPath, history);
@@ -1117,6 +1284,12 @@ async function main(): Promise<void> {
       `- Routed: ${byRoute('auto_fix_candidate').length} to an agent, ${
         byRoute('escalate').length
       } escalated, ${byRoute('no_action').length} suppressed`,
+      `- Agent assignments this run: ${
+        decisions.filter(d => d.assigned === true).length
+      } (cap ${MAX_AGENT_ASSIGNMENTS_PER_RUN}, ranked by flake rate)`,
+      COPILOT_ASSIGN_TOKEN === ''
+        ? '- _`COPILOT_ASSIGN_TOKEN` is unset — issues were labeled but not assigned to an agent._'
+        : null,
       dryRun ? '- _Dry run — no issues were created or updated._' : null,
       broadFailureRatio > BROAD_FAILURE_RATIO
         ? `- ⚠️ ${(broadFailureRatio * 100).toFixed(
