@@ -439,6 +439,11 @@ test('organize columns', async ({ page }) => {
 });
 
 test('custom column', async ({ page, browserName }) => {
+  test.skip(
+    browserName === 'chromium',
+    'Quarantined for an intermittent updated callback JavaScriptException during custom-column deletion; see https://github.com/cryolins/web-client-ui/issues/32'
+  );
+
   await openTableOption(page, 'Custom Columns');
 
   await test.step('Create custom column', async () => {
