@@ -11,6 +11,18 @@ import {
   gotoPage,
 } from './utils';
 
+async function waitForCondFormatEditor(page: Page) {
+  // Stack remounts the editor from pushing-view into main-view on pushComplete.
+  // Clicking the transient editor can lose the open picker when it unmounts.
+  // https://github.com/cryolins/web-client-ui/issues/39
+  await expect(
+    page.locator('.table-sidebar .main-view .conditional-format-editor')
+  ).toBeVisible();
+  await expect(
+    page.locator('.table-sidebar .pushing-view, .table-sidebar .popping-view')
+  ).toHaveCount(0);
+}
+
 async function changeCondFormatComparison(
   page: Page,
   condition: string,
@@ -27,6 +39,7 @@ async function changeCondFormatComparison(
   await expect(highlightCell).toHaveCount(0);
 
   await formattingRule.click();
+  await waitForCondFormatEditor(page);
 
   await expect(formattingRule).toHaveCount(0);
   await expect(conditionPicker).toHaveCount(1);
@@ -74,6 +87,7 @@ async function changeCondFormatHighlight(page: Page) {
   await expect(doneButton).toHaveCount(0);
 
   await formattingRule.click();
+  await waitForCondFormatEditor(page);
 
   await expect(highlightRow).toHaveCount(1);
   await expect(doneButton).toHaveCount(1);
@@ -174,6 +188,7 @@ test('conditional format', async ({ page }) => {
 
   await test.step('Setup new formatting rule', async () => {
     await page.getByRole('button', { name: 'Add New Rule' }).click();
+    await waitForCondFormatEditor(page);
     await page.locator('.style-editor').click();
     await page.getByRole('button', { name: 'Positive' }).click();
     await page.getByRole('button', { name: 'Done' }).click();
@@ -211,6 +226,7 @@ test('conditional format', async ({ page }) => {
     const doneButton = editor.getByRole('button', { name: 'Done' });
 
     await formattingRule.click();
+    await waitForCondFormatEditor(page);
     await highlightCell.click();
 
     // Pick "is equal to" from the Cross-Column section of the condition picker.
@@ -235,6 +251,7 @@ test('conditional format', async ({ page }) => {
     const doneButton = editor.getByRole('button', { name: 'Done' });
 
     await formattingRule.click();
+    await waitForCondFormatEditor(page);
     await highlightCell.click();
 
     // Open the "Apply to Columns" MultiSelect, filter to Double, then select it.
@@ -264,6 +281,7 @@ test('conditional format', async ({ page }) => {
     const doneButton = editor.getByRole('button', { name: 'Done' });
 
     await formattingRule.click();
+    await waitForCondFormatEditor(page);
     await highlightCell.click();
 
     // Verify the RHV column combobox is visible (cross-column mode loaded)
@@ -292,6 +310,7 @@ test('conditional format', async ({ page }) => {
     await expect(conditionPicker).toHaveCount(0);
 
     await formattingRule.click();
+    await waitForCondFormatEditor(page);
     await conditionPicker.click();
     await page.getByRole('option', { name: 'is null' }).click();
     await page
