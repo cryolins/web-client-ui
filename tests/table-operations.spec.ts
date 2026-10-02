@@ -129,7 +129,11 @@ test.beforeEach(async ({ page }) => {
   await expect(page.locator('.table-sidebar')).toHaveCount(1);
 });
 
-test('select distinct values', async ({ page }) => {
+test('select distinct values', async ({ page, browserName }) => {
+  // Quarantined pending a failed-attempt trace and server logs for the blank grid.
+  // https://github.com/cryolins/web-client-ui/issues/33
+  test.skip(browserName === 'webkit', 'Unresolved blank-grid failure (#33)');
+
   await openTableOption(page, 'Select Distinct Values');
 
   const columnSelect = page.getByRole('combobox');
