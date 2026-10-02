@@ -56,6 +56,9 @@ interface RunContext {
   commit: string;
   branch: string;
   timestamp: string;
+  // Deephaven server image the suite ran against; `edge` moves nightly, so a flake that
+  // starts without a matching frontend commit is often a server change.
+  serverVersion: string;
 }
 
 // One test's outcome for a single run, appended to its rolling history window.
@@ -645,14 +648,25 @@ function buildIssueBody(decision: Decision, ctx: RunContext): string {
 
   lines.push('**Reproduce**', fenced(reproCommand(b)), '');
 
+  const report = ctx.reportUrl
+    ? `[\`playwright-report\`](${ctx.reportUrl})`
+    : '`playwright-report` (from the run below)';
+  lines.push(
+    '**Artifacts**',
+    b.traceAttachments.length > 0
+      ? `- ${report} contains ${b.traceAttachments
+          .map(a => `\`${a}\``)
+          .join(
+            ', '
+          )} for the attempt that actually failed, not the retry that passed.`
+      : `- ${report} contains the full report for this run.`,
+    '- `server-logs-<browser>-<shard>` on the run page has the timestamped Deephaven server log, captured even when the retry passed and the job went green.',
+    `- Deephaven server image: \`${ctx.serverVersion}\`.`,
+    ''
+  );
+
   if (b.traceAttachments.length > 0) {
-    const artifact = ctx.reportUrl
-      ? `[\`playwright-report\`](${ctx.reportUrl})`
-      : '`playwright-report` (from the run below)';
     lines.push(
-      `**Artifacts** — ${artifact} contains ${b.traceAttachments
-        .map(a => `\`${a}\``)
-        .join(', ')} for the failing attempt.`,
       'Inspect a trace without the GUI:',
       fenced(
         [
@@ -852,6 +866,7 @@ async function main(): Promise<void> {
     commit: process.env.GITHUB_SHA ?? 'unknown',
     branch: process.env.GITHUB_REF_NAME ?? 'unknown',
     timestamp: new Date().toISOString(),
+    serverVersion: process.env.DHC_VERSION ?? 'unknown',
   };
 
   // No token/repo, or an explicit --dry-run: only write local files, never touch GitHub issues.

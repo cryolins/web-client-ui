@@ -88,12 +88,16 @@ jobs:
           path: blob-report/
           retention-days: 1
 
+      # Collected even when the job is green: a test that fails and then passes on retry leaves
+      # the job successful, and those are exactly the flakes the nightly triage needs logs for.
+      # docker logs writes the container's stderr to its own stderr, so 2>&1 is required or
+      # every stderr line the server emits is silently dropped.
       - name: Dump server logs
-        if: failure()
-        run: docker logs dhc-server > /tmp/server-log.txt
+        if: ${{ !cancelled() }}
+        run: docker logs --timestamps dhc-server > /tmp/server-log.txt 2>&1
 
       - name: Upload server logs
-        if: failure()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: server-logs-${{ matrix.config }}
