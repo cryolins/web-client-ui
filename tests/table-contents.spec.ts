@@ -188,8 +188,11 @@ test.describe('scrolling', () => {
     await page.keyboard.press('PageDown');
     await waitForLoadingDone(page);
 
+    // The snapshot only reflects the new viewport after the grid's next draw
+    await expect
+      .poll(async () => (await getVisibleRows(grid))[0])
+      .toBeGreaterThan(0);
     const rows = await getVisibleRows(grid);
-    expect(rows[0]).toBeGreaterThan(0);
 
     // Headers must not shift when only the rows scroll
     await expectColumnHeaderNames(grid, ['x', 'y', 'z']);
