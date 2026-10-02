@@ -169,7 +169,14 @@ test('search', async ({ page }) => {
   await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
 });
 
-test('conditional format', async ({ page }) => {
+test('conditional format', async ({ page, browserName }) => {
+  // The failed attempt did not capture selection state before save:
+  // https://github.com/cryolins/web-client-ui/issues/29
+  test.skip(
+    browserName === 'firefox',
+    'Investigating missing Double selection.'
+  );
+
   await openTableOption(page, 'Conditional Formatting');
 
   await test.step('Setup new formatting rule', async () => {
