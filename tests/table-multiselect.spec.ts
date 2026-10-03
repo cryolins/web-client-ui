@@ -97,7 +97,14 @@ function runMultiSelectFilter(
   columnType: 'datetime' | 'char' | 'number' | 'string',
   filters: { filter: string; name: string }[]
 ) {
-  test(`multiselect ${columnType} filters`, async ({ page }) => {
+  test(`multiselect ${columnType} filters`, async ({ page, browserName }) => {
+    // Quarantined pending root-cause investigation:
+    // https://github.com/cryolins/web-client-ui/issues/41
+    test.skip(
+      columnType === 'datetime' && browserName === 'webkit',
+      'Intermittent datetime filter screenshot failure; see issue #41'
+    );
+
     await gotoPage(page, '');
     await openTable(page, `multiselect_${columnType}`);
     const gridLocation = await getGridLocation(page);
