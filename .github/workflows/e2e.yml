@@ -286,7 +286,6 @@ jobs:
           # Unset this secret to keep triage label-only.
           COPILOT_ASSIGN_TOKEN: ${{ secrets.COPILOT_ASSIGN_TOKEN }}
           REPORT_ARTIFACT_URL: ${{ needs.merge-reports.outputs.report-url }}
-          MAX_AGENT_ASSIGNMENTS_PER_RUN: '2'
         run: |
           node ./tests/nightly-flake-triage.ts \
             --report ./report.json \
