@@ -1381,6 +1381,8 @@ async function main(): Promise<void> {
   // Convenience filter for tallying decisions by route in the job summary below.
   const byRoute = (route: Route): Decision[] =>
     decisions.filter(d => d.route === route);
+  const agentEligible = byRoute('auto_fix_candidate').length;
+  const agentAssigned = decisions.filter(d => d.assigned === true).length;
   writeSummary(
     `${[
       '### Nightly E2E triage',
@@ -1389,12 +1391,13 @@ async function main(): Promise<void> {
         counts.flaky ?? 0
       } flaky, ${counts.unexpected ?? 0} failed`,
       `- ${failing.length} failing test(s) grouped into ${decisions.length} fingerprint(s)`,
-      `- Routed: ${byRoute('auto_fix_candidate').length} to an agent, ${
+      `- Routed: ${agentEligible} agent-eligible, ${
         byRoute('escalate').length
-      } escalated, ${byRoute('no_action').length} suppressed`,
-      `- Agent assignments this run: ${
-        decisions.filter(d => d.assigned === true).length
-      } (cap ${MAX_AGENT_ASSIGNMENTS_PER_RUN}, ranked by flake rate)`,
+      } escalated to a human, ${byRoute('no_action').length} suppressed`,
+      `- Agent assignments this run: ${agentAssigned} of ${agentEligible} eligible (cap ${MAX_AGENT_ASSIGNMENTS_PER_RUN}, ranked by flake rate)`,
+      agentAssigned < agentEligible
+        ? '- _An agent is only assigned when an issue is opened or reopened; eligible fingerprints whose issue was already open keep the session or human already working on them._'
+        : null,
       COPILOT_ASSIGN_TOKEN === ''
         ? '- _`COPILOT_ASSIGN_TOKEN` is unset — issues were labeled but not assigned to an agent._'
         : null,
@@ -1407,15 +1410,17 @@ async function main(): Promise<void> {
       '',
       ...(decisions.length
         ? [
-            '| Route | Fingerprint | Classification | Flake rate | Tests | Issue |',
-            '| --- | --- | --- | --- | --- | --- |',
+            '| Route | Fingerprint | Classification | Flake rate | Tests | Issue | Agent |',
+            '| --- | --- | --- | --- | --- | --- | --- |',
             ...decisions.map(
               d =>
                 `| ${d.route} | \`${d.bundle.fingerprint}\` | ${
                   d.bundle.classification
                 } | ${d.bundle.flakeRate} (${d.bundle.historyWindow} runs) | ${
                   d.bundle.tests.length
-                } | ${d.issue != null ? `#${d.issue}` : '—'} |`
+                } | ${d.issue != null ? `#${d.issue}` : '—'} | ${
+                  d.assigned === true ? 'assigned' : '—'
+                } |`
             ),
           ]
         : []),
