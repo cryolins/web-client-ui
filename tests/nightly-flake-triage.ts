@@ -131,6 +131,7 @@ interface Bundle {
   flakeRate: number;
   historyWindow: number;
   priorFixAttempts: number;
+  priorPullRequests: string[];
   traceAttachments: string[];
 }
 
@@ -215,6 +216,14 @@ interface GithubIssue {
   number: number;
   state: 'open' | 'closed';
   body?: string;
+  // Present only when the item is really a pull request; the issues endpoint returns both.
+  pull_request?: unknown;
+}
+
+// Minimal shape of the cross-referenced entries in an issue's timeline.
+interface TimelineEvent {
+  event?: string;
+  source?: { issue?: { html_url?: string; pull_request?: unknown } };
 }
 
 // Thin wrapper over the subset of the GitHub REST API this script needs.
@@ -226,7 +235,8 @@ interface GithubClient {
   ) => Promise<GithubIssue | null>;
   comment: (number: number, body: string) => Promise<unknown>;
   createIssue: (payload: Record<string, unknown>) => Promise<GithubIssue>;
-  fetchOpenIssuesWithLabel: (label: string) => Promise<GithubIssue[]>;
+  fetchIssuesWithLabel: (label: string) => Promise<GithubIssue[]>;
+  fetchLinkedPullRequests: (number: number) => Promise<string[]>;
   // null when no user token is configured, since agent assignment requires one.
   assignAgent: ((number: number) => Promise<unknown>) | null;
 }
@@ -620,6 +630,16 @@ function buildIssueBody(decision: Decision, ctx: RunContext): string {
     );
   }
 
+  if (b.priorPullRequests.length > 0) {
+    lines.push(
+      '',
+      '**Fixes already attempted for this fingerprint — each one failed to hold:**',
+      ...b.priorPullRequests.map(url => `- ${url}`),
+      '',
+      '> Read these before starting. Repeating an approach that already recurred wastes the attempt and pushes this issue closer to being escalated to a human.'
+    );
+  }
+
   lines.push(
     '',
     `> ${CLASSIFICATION_MESSAGES[b.classification]}`,
@@ -758,22 +778,40 @@ function makeClient(token: string, repository: string): GithubClient {
         method: 'POST',
         body: JSON.stringify(payload),
       }).then(issue => issue as GithubIssue),
-    async fetchOpenIssuesWithLabel(label: string): Promise<GithubIssue[]> {
+    // Closed issues are included so a cold cache reopens the original rather than opening a
+    // duplicate, which would also reset the fix-attempt count that drives escalation. Sorted
+    // by recency because a recurrence is always recent and the page budget is finite.
+    async fetchIssuesWithLabel(label: string): Promise<GithubIssue[]> {
       const all: GithubIssue[] = [];
       let page = 1;
       let keepGoing = true;
       while (keepGoing && page <= 5) {
         // eslint-disable-next-line no-await-in-loop
         const batch = await request<GithubIssue[]>(
-          `/repos/${owner}/${repo}/issues?state=open&labels=${encodeURIComponent(
+          `/repos/${owner}/${repo}/issues?state=all&labels=${encodeURIComponent(
             label
-          )}&per_page=100&page=${page}`
+          )}&sort=updated&direction=desc&per_page=100&page=${page}`
         );
         all.push(...(batch ?? []));
         keepGoing = Boolean(batch && batch.length >= 100);
         page += 1;
       }
       return all;
+    },
+    // Pull requests that referenced this issue, i.e. the fixes already attempted for it.
+    async fetchLinkedPullRequests(number: number): Promise<string[]> {
+      const events = await request<TimelineEvent[]>(
+        `/repos/${owner}/${repo}/issues/${number}/timeline?per_page=100`
+      );
+      const urls = (events ?? [])
+        .filter(
+          e =>
+            e.event === 'cross-referenced' &&
+            e.source?.issue?.pull_request !== undefined
+        )
+        .map(e => e.source?.issue?.html_url)
+        .filter((url): url is string => Boolean(url));
+      return [...new Set(urls)];
     },
     assignAgent:
       COPILOT_ASSIGN_TOKEN === ''
@@ -1035,6 +1073,7 @@ async function main(): Promise<void> {
         flakeRate: Number(flakeRate.toFixed(2)),
         historyWindow,
         priorFixAttempts: recurredAttempts(state).length,
+        priorPullRequests: [],
         traceAttachments: [...new Set(group.flatMap(g => g.attachments))],
       },
     };
@@ -1123,6 +1162,31 @@ async function main(): Promise<void> {
     }
   });
 
+  // Collect the PRs that already failed to fix each recurring fingerprint. Only fingerprints
+  // with a recorded recurrence are worth the API call, and the list goes into the issue body
+  // below so the next session starts from what was already tried.
+  if (gh) {
+    await Promise.all(
+      decisions
+        .filter(d => d.bundle.priorFixAttempts > 0)
+        .map(async decision => {
+          const { issueNumber } =
+            history.fingerprints[decision.bundle.fingerprint];
+          if (issueNumber === undefined) return;
+          try {
+            decision.bundle.priorPullRequests =
+              await gh.fetchLinkedPullRequests(issueNumber);
+          } catch (err) {
+            console.warn(
+              `Could not list prior fix PRs for #${issueNumber}: ${
+                (err as Error).message
+              }`
+            );
+          }
+        })
+    );
+  }
+
   // ---- 4. open or update one issue per fingerprint ----
 
   // Rank agent candidates by flake rate so the cap spends its budget on the fingerprints with
@@ -1142,15 +1206,27 @@ async function main(): Promise<void> {
 
   // Fall back to matching by the embedded marker if history lost track of an issue number
   // (e.g. a cold cache), so a fingerprint doesn't get a duplicate issue opened for it.
-  const existingByFingerprint = new Map<string, number>();
+  const existingByFingerprint = new Map<
+    string,
+    { number: number; state: 'open' | 'closed' }
+  >();
   if (gh) {
     try {
-      const open = await gh.fetchOpenIssuesWithLabel(BASE_LABEL);
-      open.forEach(issue => {
+      const known = await gh.fetchIssuesWithLabel(BASE_LABEL);
+      known.forEach(issue => {
+        // An agent's PR often quotes the issue body, marker included, and the issues endpoint
+        // returns PRs too -- matching one would make us comment on the PR instead of the issue.
+        if (issue.pull_request !== undefined) return;
         const match = issue.body?.match(
           /<!-- test-health-fingerprint: ([0-9a-f]+) -->/
         );
-        if (match) existingByFingerprint.set(match[1], issue.number);
+        // Results are newest-first, so the first match for a fingerprint is the live one.
+        if (match && !existingByFingerprint.has(match[1])) {
+          existingByFingerprint.set(match[1], {
+            number: issue.number,
+            state: issue.state,
+          });
+        }
       });
     } catch (err) {
       console.warn(
@@ -1178,7 +1254,8 @@ async function main(): Promise<void> {
 
     const body = buildIssueBody(decision, ctx);
     const labels = labelsFor(decision);
-    const issueNumber = state.issueNumber ?? existingByFingerprint.get(fp);
+    const known = existingByFingerprint.get(fp);
+    const issueNumber = state.issueNumber ?? known?.number;
     // Keep the rendered issue on the decision so a dry run is reviewable.
     decision.rendered = { title: buildTitle(decision.bundle), labels, body };
     const wantsAgent = assignable.has(fp);
@@ -1201,7 +1278,8 @@ async function main(): Promise<void> {
 
     try {
       if (issueNumber !== undefined) {
-        const reopening = state.issueState === 'closed';
+        // Fall back to the freshly fetched state when the cache has no record of this issue.
+        const reopening = (state.issueState ?? known?.state) === 'closed';
         await gh?.updateIssue(issueNumber, {
           body,
           labels,
