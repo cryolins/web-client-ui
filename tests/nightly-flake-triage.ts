@@ -779,26 +779,41 @@ function makeClient(token: string, repository: string): GithubClient {
       COPILOT_ASSIGN_TOKEN === ''
         ? null
         : async (number: number) => {
-            // Deliberately not using request(): this one call needs the user token, and
+            // Deliberately not using request(): these calls need the user token, and
             // agent_assignment selects which custom agent picks the issue up.
-            const res = await fetch(
-              `${api}/repos/${owner}/${repo}/issues/${number}/assignees`,
-              {
-                method: 'POST',
-                headers: {
-                  ...headers,
-                  Authorization: `Bearer ${COPILOT_ASSIGN_TOKEN}`,
+            const assigneesUrl = `${api}/repos/${owner}/${repo}/issues/${number}/assignees`;
+            const agentHeaders = {
+              ...headers,
+              Authorization: `Bearer ${COPILOT_ASSIGN_TOKEN}`,
+            };
+
+            // Copilot only starts a session on an unassigned -> assigned transition. Closing an
+            // issue does not clear its assignee, so a reopened one still carries the bot from the
+            // last attempt and re-POSTing it is a silent no-op. Clear it first to force a new
+            // session on a new PR; on a brand-new issue this is a harmless no-op.
+            const cleared = await fetch(assigneesUrl, {
+              method: 'DELETE',
+              headers: agentHeaders,
+              body: JSON.stringify({ assignees: [COPILOT_ASSIGNEE] }),
+            });
+            if (!cleared.ok) {
+              console.warn(
+                `Could not clear the existing assignee on #${number} (${cleared.status}); a new agent session may not start.`
+              );
+            }
+
+            const res = await fetch(assigneesUrl, {
+              method: 'POST',
+              headers: agentHeaders,
+              body: JSON.stringify({
+                assignees: [COPILOT_ASSIGNEE],
+                agent_assignment: {
+                  target_repo: repository,
+                  base_branch: COPILOT_BASE_BRANCH,
+                  custom_agent: COPILOT_CUSTOM_AGENT,
                 },
-                body: JSON.stringify({
-                  assignees: [COPILOT_ASSIGNEE],
-                  agent_assignment: {
-                    target_repo: repository,
-                    base_branch: COPILOT_BASE_BRANCH,
-                    custom_agent: COPILOT_CUSTOM_AGENT,
-                  },
-                }),
-              }
-            );
+              }),
+            });
             if (!res.ok) {
               throw new Error(
                 `POST /issues/${number}/assignees -> ${res.status}: ${(
@@ -1195,7 +1210,7 @@ async function main(): Promise<void> {
         await gh?.comment(
           issueNumber,
           reopening
-            ? `Recurred after this issue was closed — run ${ctx.runUrl}. Reopening; the previous fix did not hold.`
+            ? `Recurred after this issue was closed — run ${ctx.runUrl}. Reopening; the previous fix did not hold. The earlier pull request is left closed — this gets a fresh investigation rather than a reopened branch.`
             : `Still failing — run ${ctx.runUrl}.`
         );
         state.issueState = 'open';
