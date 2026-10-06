@@ -274,7 +274,7 @@ const COPILOT_BASE_BRANCH = process.env.COPILOT_BASE_BRANCH ?? 'main';
 // Cap how many fingerprints get handed to an agent per run so one bad night can't open a
 // dozen concurrent sessions and PRs. Adjust as needed.
 const MAX_AGENT_ASSIGNMENTS_PER_RUN = Number(
-  process.env.MAX_AGENT_ASSIGNMENTS_PER_RUN ?? 2
+  process.env.MAX_AGENT_ASSIGNMENTS_PER_RUN ?? 3
 );
 
 // Failures under these paths always go to a human, never to an agent.
