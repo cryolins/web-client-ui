@@ -62,6 +62,61 @@ async function renderConsoleInput(
   return result;
 }
 
+describe('ConsoleInput initial focus', () => {
+  it('focuses the editor when no other control has focus', async () => {
+    const ref = React.createRef<ConsoleInput>();
+    await renderConsoleInput(makeSession(), ref);
+
+    expect(ref.current!.commandEditor!.hasTextFocus()).toBe(true);
+  });
+
+  it.each(['outside', 'console'])(
+    'respects focus in %s while Monaco loads',
+    async target => {
+      const monaco = MonacoUtils.getMonaco();
+      let finishLoading!: (value: typeof monaco) => void;
+      const loading = new Promise<typeof monaco>(resolve => {
+        finishLoading = resolve;
+      });
+      jest.spyOn(MonacoUtils, 'load').mockReturnValueOnce(loading);
+
+      const session = makeSession();
+      const ref = React.createRef<ConsoleInput>();
+      const { getByRole } = render(
+        <>
+          <input aria-label="Other control" />
+          <ConsoleInput
+            ref={ref}
+            session={session}
+            language="test"
+            commandHistoryStorage={makeMockCommandHistoryStorage()}
+            onSubmit={jest.fn()}
+          />
+        </>
+      );
+      const otherControl = getByRole('textbox', { name: 'Other control' });
+      const consoleContainer = ref.current!.commandContainer.current!;
+      consoleContainer.tabIndex = -1;
+      const focusedElement =
+        target === 'outside' ? otherControl : consoleContainer;
+      focusedElement.focus();
+      expect(session.openDocument).not.toHaveBeenCalled();
+
+      await act(async () => {
+        finishLoading(monaco);
+      });
+      await waitFor(() => expect(session.openDocument).toHaveBeenCalled());
+
+      if (target === 'outside') {
+        expect(document.activeElement).toBe(otherControl);
+        expect(ref.current!.commandEditor!.hasTextFocus()).toBe(false);
+      } else {
+        expect(ref.current!.commandEditor!.hasTextFocus()).toBe(true);
+      }
+    }
+  );
+});
+
 describe('ConsoleInput session transition', () => {
   it('notifies the initial session when the document is opened', async () => {
     const session = makeSession();
