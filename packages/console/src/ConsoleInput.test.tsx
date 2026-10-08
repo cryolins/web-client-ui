@@ -63,6 +63,27 @@ async function renderConsoleInput(
 }
 
 describe('ConsoleInput session transition', () => {
+  it('focuses the initialized editor when no other control has focus', async () => {
+    const session = makeSession();
+    const ref = React.createRef<ConsoleInput>();
+    await renderConsoleInput(session, ref);
+
+    expect(ref.current!.commandEditor!.hasTextFocus()).toBe(true);
+  });
+
+  it('preserves focus on another control while the editor initializes', async () => {
+    const { getByRole } = render(<input aria-label="Panel search" />);
+    const search = getByRole('textbox', { name: 'Panel search' });
+    search.focus();
+
+    const session = makeSession();
+    const ref = React.createRef<ConsoleInput>();
+    await renderConsoleInput(session, ref);
+
+    expect(search).toHaveFocus();
+    expect(ref.current!.commandEditor!.hasTextFocus()).toBe(false);
+  });
+
   it('notifies the initial session when the document is opened', async () => {
     const session = makeSession();
     const ref = React.createRef<ConsoleInput>();
