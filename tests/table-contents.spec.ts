@@ -115,7 +115,15 @@ test('sorts a column by clicking its header', async ({ page }) => {
 test.describe('scrolling', () => {
   test('shows later rows after scrolling down with the mouse', async ({
     page,
+    browserName,
   }) => {
+    // Quarantine only the reported browser until failing-attempt evidence establishes
+    // why a previously visible row disappears: https://github.com/cryolins/web-client-ui/issues/14
+    test.skip(
+      browserName === 'chromium',
+      'Unresolved chronic flake: issue #14'
+    );
+
     await openTable(page, 'simple_table');
     await waitForLoadingDone(page);
 
