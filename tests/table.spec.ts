@@ -150,6 +150,32 @@ test('can open a table with column header groups and hidden columns', async ({
   await expect(page.locator('.iris-grid-panel .iris-grid')).toHaveScreenshot();
 });
 
+test('initializing the console preserves panel search focus', async ({ page }) => {
+  // Exercise the load ordering from https://github.com/cryolins/web-client-ui/issues/47.
+  let resumeEditorLoad: () => void = () => {};
+  const editorLoad = new Promise<void>(resolve => {
+    resumeEditorLoad = resolve;
+  });
+  await page.route('**/assets/editor.main-*.js', async route => {
+    await editorLoad;
+    await route.continue();
+  });
+
+  await gotoPage(page, '');
+  await page.getByRole('button', { name: 'Panels', exact: true }).click();
+  const search = page.getByPlaceholder('Find Table, Plot or Widget');
+  await search.fill('simple_table_header_group_hide');
+  await expect(search).toBeFocused();
+
+  resumeEditorLoad();
+  await expect(page.locator('.console-input .monaco-editor')).toBeVisible();
+  await expect(search).toBeFocused();
+  await page
+    .getByRole('button', { name: 'simple_table_header_group_hide', exact: true })
+    .click();
+  await expect(page.locator('.iris-grid-panel .iris-grid')).toBeVisible();
+});
+
 test.describe('tests simple table operations', () => {
   test.beforeEach(async ({ page }) => {
     await gotoPage(page, '');
