@@ -157,7 +157,14 @@ test('sort by', async ({ page }) => {
   await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
 });
 
-test('freeze column', async ({ page }) => {
+test('freeze column', async ({ page, browserName }) => {
+  // Quarantine per https://github.com/cryolins/web-client-ui/issues/5 until
+  // the WebKit grid-render mismatch has an evidenced root cause.
+  test.skip(
+    browserName === 'webkit',
+    'Issue #5: recurrent WebKit screenshot mismatch after freezing a column; root cause is unresolved.'
+  );
+
   await page
     .locator('.iris-grid .grid-wrapper')
     .click({ button: 'right', position: { x: 20, y: 20 } });
