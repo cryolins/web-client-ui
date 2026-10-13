@@ -369,7 +369,14 @@ test.describe('column group separators', () => {
     await openTable(page, 'simple_table_header_group');
   });
 
-  test('change color on hover on level 0', async ({ page }) => {
+  test('change color on hover on level 0', async ({ page, browserName }) => {
+    // WebKit can capture a blank canvas despite a painted trace frame; the cause is unresolved.
+    // Investigation: https://github.com/cryolins/web-client-ui/issues/12
+    test.skip(
+      browserName === 'webkit',
+      'Unresolved blank canvas during screenshot capture: https://github.com/cryolins/web-client-ui/issues/12'
+    );
+
     // Test hover on the parent of the column "X" (column 0, depth 1)
     const separatorPos = await getColumnSeparatorPosition(page, 0, 1);
 
