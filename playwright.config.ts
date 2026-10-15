@@ -56,6 +56,8 @@ const config: PlaywrightTestConfig = {
      */
     trace: 'retain-on-failure',
 
+    screenshot: 'only-on-failure',
+
     /**
      * Retain videos on failure locally for easier debugging.
      * In CI, only retain videos on the first retry to speed
