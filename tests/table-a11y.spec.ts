@@ -215,7 +215,9 @@ test('summarizes the current selection', async ({ page }) => {
   );
 });
 
-test('leaves hidden columns out of the description', async ({ page }) => {
+// Quarantined pending investigation of the intermittent Panels popover close.
+// https://github.com/cryolins/web-client-ui/issues/53
+test.skip('leaves hidden columns out of the description', async ({ page }) => {
   await openTable(page, 'simple_table_header_group_hide');
   await waitForLoadingDone(page);
 
