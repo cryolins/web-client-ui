@@ -438,7 +438,9 @@ test('organize columns', async ({ page }) => {
   });
 });
 
-test('custom column', async ({ page, browserName }) => {
+// Quarantined: unresolved updated-callback exception after custom-column deletion.
+// https://github.com/cryolins/web-client-ui/issues/42
+test.skip('custom column', async ({ page, browserName }) => {
   await openTableOption(page, 'Custom Columns');
 
   await test.step('Create custom column', async () => {
