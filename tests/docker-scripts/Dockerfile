@@ -60,5 +60,8 @@ RUN npm ci
 # https://stackoverflow.com/a/34300129
 COPY . .
 
+ARG E2E_FRONTEND_COMMIT=unknown
+ENV E2E_FRONTEND_COMMIT=$E2E_FRONTEND_COMMIT
+
 # Now build the app with our playwright.css included
 RUN VITE_PLAYWRIGHT_CSS=1 npm run build

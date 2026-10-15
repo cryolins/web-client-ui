@@ -24,6 +24,8 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    outputs:
+      backend-image: ${{ steps.backend.outputs.image }}
     concurrency:
       group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-build
       cancel-in-progress: true
@@ -32,9 +34,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Resolve backend once for all test jobs
+        id: backend
+        run: |
+          docker pull "ghcr.io/deephaven/server:${DHC_VERSION}"
+          image=$(docker image inspect "ghcr.io/deephaven/server:${DHC_VERSION}" --format '{{index .RepoDigests 0}}')
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
       - name: Build and Save docker image
         run: |
-          docker build -t e2e-ci:test -f ./tests/docker-scripts/Dockerfile .
+          docker build --build-arg E2E_FRONTEND_COMMIT="$(git rev-parse HEAD)" -t e2e-ci:test -f ./tests/docker-scripts/Dockerfile .
           docker save e2e-ci -o e2e-ci.tar.gz
 
       - name: Store docker build for test matrix
@@ -47,6 +56,8 @@ jobs:
   e2e-tests:
     runs-on: ubuntu-22.04
     needs: build
+    env:
+      DHC_IMAGE: ${{ needs.build.outputs.backend-image }}
     concurrency:
       group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-e2e-tests-${{ matrix.config }}
       cancel-in-progress: true
@@ -104,10 +115,47 @@ jobs:
           path: /tmp/server-log.txt
           retention-days: 14
 
+  custom-column-diagnostics:
+    runs-on: ubuntu-22.04
+    needs: build
+    # Evidence only: intentionally excluded from e2e-results and report merging/triage.
+    continue-on-error: true
+    env:
+      DHC_IMAGE: ${{ needs.build.outputs.backend-image }}
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-custom-column-diagnostics
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download matched frontend image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-cache
+      - name: Load docker image
+        run: docker load -i e2e-ci.tar.gz
+      - name: Repeat table operations with Chromium quarantine bypassed
+        run: './tests/docker-scripts/run.sh e2e-diagnostics'
+      - name: Dump diagnostic server logs
+        if: ${{ !cancelled() }}
+        run: docker logs --timestamps dhc-server > diagnostic-server-log.txt 2>&1
+      - name: Upload diagnostic evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: custom-column-diagnostics
+          path: |
+            diagnostic-report/
+            test-results/custom-column-diagnostics/
+            diagnostic-server-log.txt
+          retention-days: 14
+
   record-new-tests:
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-22.04
     needs: build
+    env:
+      DHC_IMAGE: ${{ needs.build.outputs.backend-image }}
     # Recording is informational only - never block the PR on it.
     continue-on-error: true
     timeout-minutes: 45
