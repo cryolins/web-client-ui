@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { expect } from '@playwright/test';
 import {
   clickCell,
   clickColumnHeader,
@@ -11,6 +11,7 @@ import {
   waitForGrid,
 } from '@deephaven/playwright-grid';
 import { gotoPage, openTable, waitForLoadingDone } from './utils';
+import { test, scrollDiagnosticsEnabled } from './table-scroll-diagnostics';
 
 /**
  * Content based versions of the table tests that would otherwise be pinned by a
@@ -115,32 +116,56 @@ test('sorts a column by clicking its header', async ({ page }) => {
 test.describe('scrolling', () => {
   test('shows later rows after scrolling down with the mouse', async ({
     page,
+    browserName,
+    scrollDiagnostics,
   }) => {
+    // Quarantine only the reported browser until failing-attempt evidence establishes
+    // why a previously visible row disappears: https://github.com/cryolins/web-client-ui/issues/14
+    // DH_GRID_SCROLL_DIAGNOSTICS=1 deliberately opts in to unquarantined recording.
+    test.skip(
+      browserName === 'chromium' && !scrollDiagnosticsEnabled,
+      'Unresolved chronic flake: issue #14'
+    );
+
     await openTable(page, 'simple_table');
     await waitForLoadingDone(page);
 
     const grid = page.locator(GRID);
     await waitForGrid(grid);
+    if (scrollDiagnostics != null) {
+      await scrollDiagnostics.observe(grid);
+    }
     await expectCellText(grid, 'x', 0, '0');
 
     const before = await getVisibleRows(grid);
+    scrollDiagnostics?.record('before-capture', { rows: before });
     expect(before[0]).toBe(0);
 
     // The first wheel event can land before the grid is ready to handle it
+    let wheelAttempt = 0;
     await expect(async () => {
       await page.locator('.iris-grid .grid-wrapper').hover();
+      wheelAttempt += 1;
+      scrollDiagnostics?.record('wheel-command', { attempt: wheelAttempt });
       await page.mouse.wheel(0, 500);
+      scrollDiagnostics?.record('wheel-command-returned', {
+        attempt: wheelAttempt,
+      });
       await waitForLoadingDone(page);
 
-      expect((await getVisibleRows(grid))[0]).toBeGreaterThan(0);
+      const visible = await getVisibleRows(grid);
+      scrollDiagnostics?.record('wheel-predicate', { rows: visible });
+      expect(visible[0]).toBeGreaterThan(0);
     }).toPass();
 
     const after = await getVisibleRows(grid);
+    scrollDiagnostics?.record('after-capture', { rows: after });
 
     // x=i, so each visible row must still show its own index
     const rows = after.slice(0, 5);
     /* eslint-disable no-await-in-loop */
     for (let i = 0; i < rows.length; i += 1) {
+      scrollDiagnostics?.record('cell-assertion', { row: rows[i] });
       await expectCellText(grid, 'x', rows[i], `${rows[i]}`);
     }
     /* eslint-enable no-await-in-loop */
