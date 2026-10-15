@@ -642,7 +642,13 @@ test('rollup rows and aggregate columns', async ({ page }) => {
   });
 });
 
-test('advanced settings', async ({ page }) => {
+test('advanced settings', async ({ page, browserName }) => {
+  // WebKit quarantine pending diagnosis of React #185: https://github.com/cryolins/web-client-ui/issues/54
+  test.skip(
+    browserName === 'webkit',
+    'Unresolved maximum update depth error when toggling the control-filter setting'
+  );
+
   const table2Name = generateVarName('t2');
 
   await test.step('create 2nd table', async () => {
