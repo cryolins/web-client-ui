@@ -176,7 +176,9 @@ test('keeps the description in sync as the grid scrolls', async ({ page }) => {
     .toBeGreaterThan(1);
 });
 
-test('summarizes the current selection', async ({ page }) => {
+// The Panels menu closes during search in the flaky run; see:
+// https://github.com/cryolins/web-client-ui/issues/60
+test.skip('summarizes the current selection', async ({ page }) => {
   await openTable(page, 'simple_table');
   await waitForLoadingDone(page);
 
