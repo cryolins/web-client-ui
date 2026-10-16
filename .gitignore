@@ -39,6 +39,7 @@ tsconfig.tsbuildinfo
 packages/*/package-lock.json
 /test-results/
 /playwright-report/
+/diagnostic-report/
 /playwright/.cache/
 /tests/*-snapshots/*
 !/tests/*-snapshots/*-linux*
