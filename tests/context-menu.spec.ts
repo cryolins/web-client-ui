@@ -47,30 +47,38 @@ test('toggle column visibility', async ({ page }) => {
   await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
 });
 
-test('quick filter and clear', async ({ page }) => {
-  await page
-    .locator('.iris-grid .grid-wrapper')
-    .click({ button: 'right', position: { x: 20, y: 20 } });
+test.describe(() => {
+  // Unresolved WebKit startup crash: https://github.com/cryolins/web-client-ui/issues/63
+  test.skip(
+    ({ browserName }) => browserName === 'webkit',
+    'Quarantined pending investigation of the WebKit startup crash'
+  );
 
-  await page.getByRole('button', { name: 'Quick Filters' }).click();
-  await page.keyboard.type('a999');
+  test('quick filter and clear', async ({ page }) => {
+    await page
+      .locator('.iris-grid .grid-wrapper')
+      .click({ button: 'right', position: { x: 20, y: 20 } });
 
-  await waitForLoadingDone(page);
-  await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
+    await page.getByRole('button', { name: 'Quick Filters' }).click();
+    await page.keyboard.type('a999');
 
-  await page
-    .locator('.iris-grid .grid-wrapper')
-    .click({ button: 'right', position: { x: 20, y: 20 } });
+    await waitForLoadingDone(page);
+    await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
 
-  await page.getByRole('button', { name: 'Clear Column Filter' }).click();
+    await page
+      .locator('.iris-grid .grid-wrapper')
+      .click({ button: 'right', position: { x: 20, y: 20 } });
 
-  await page
-    .locator('.iris-grid .grid-wrapper')
-    .hover({ position: { x: 20, y: 20 } });
-  await page.mouse.wheel(0, -100);
+    await page.getByRole('button', { name: 'Clear Column Filter' }).click();
 
-  await waitForLoadingDone(page);
-  await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
+    await page
+      .locator('.iris-grid .grid-wrapper')
+      .hover({ position: { x: 20, y: 20 } });
+    await page.mouse.wheel(0, -100);
+
+    await waitForLoadingDone(page);
+    await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
+  });
 });
 
 test('advanced filters', async ({ page }) => {
