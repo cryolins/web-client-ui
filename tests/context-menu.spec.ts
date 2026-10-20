@@ -18,7 +18,9 @@ async function moveMouseAwayFromTable(page: Page) {
   await page.mouse.click(0, 0);
 }
 
-test.beforeEach(async ({ page }) => {
+const tableTest = test.extend({});
+
+tableTest.beforeEach(async ({ page }) => {
   await gotoPage(page, '');
   await openTable(page, 'all_types');
 
@@ -31,7 +33,7 @@ test.beforeEach(async ({ page }) => {
   await expect(page.locator('.table-sidebar')).toHaveCount(1);
 });
 
-test('toggle column visibility', async ({ page }) => {
+tableTest('toggle column visibility', async ({ page }) => {
   await page
     .locator('.iris-grid .grid-wrapper')
     .click({ button: 'right', position: { x: 20, y: 20 } });
@@ -47,7 +49,7 @@ test('toggle column visibility', async ({ page }) => {
   await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
 });
 
-test('quick filter and clear', async ({ page }) => {
+tableTest('quick filter and clear', async ({ page }) => {
   await page
     .locator('.iris-grid .grid-wrapper')
     .click({ button: 'right', position: { x: 20, y: 20 } });
@@ -73,7 +75,7 @@ test('quick filter and clear', async ({ page }) => {
   await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
 });
 
-test('advanced filters', async ({ page }) => {
+tableTest('advanced filters', async ({ page }) => {
   await openAdvancedFilters(page);
   await page.getByLabel('Sort String Ascending').click();
 
@@ -124,7 +126,7 @@ test('advanced filters', async ({ page }) => {
   await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
 });
 
-test('sort by', async ({ page }) => {
+tableTest('sort by', async ({ page }) => {
   await page
     .locator('.iris-grid .grid-wrapper')
     .click({ button: 'right', position: { x: 20, y: 20 } });
@@ -157,7 +159,7 @@ test('sort by', async ({ page }) => {
   await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
 });
 
-test('freeze column', async ({ page }) => {
+tableTest('freeze column', async ({ page }) => {
   await page
     .locator('.iris-grid .grid-wrapper')
     .click({ button: 'right', position: { x: 20, y: 20 } });
@@ -177,7 +179,7 @@ test('freeze column', async ({ page }) => {
   await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
 });
 
-test('reverse table', async ({ page }) => {
+tableTest('reverse table', async ({ page }) => {
   await page
     .locator('.iris-grid .grid-wrapper')
     .click({ button: 'right', position: { x: 20, y: 20 } });
@@ -188,7 +190,7 @@ test('reverse table', async ({ page }) => {
   await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
 });
 
-test('filter by value', async ({ page }) => {
+tableTest('filter by value', async ({ page }) => {
   await page
     .locator('.iris-grid .grid-wrapper')
     .click({ button: 'right', position: { x: 20, y: 60 } });
@@ -207,7 +209,7 @@ test('filter by value', async ({ page }) => {
   await page.getByRole('button', { name: 'Clear Column Filter' }).click();
 });
 
-test('go to', async ({ page }) => {
+tableTest('go to', async ({ page }) => {
   await page
     .locator('.iris-grid .grid-wrapper')
     .click({ button: 'right', position: { x: 20, y: 60 } });
@@ -234,6 +236,8 @@ test('go to', async ({ page }) => {
 test('open custom context menu with another custom context menu open', async ({
   page,
 }) => {
+  await gotoPage(page, '');
+
   await page.getByText('Console', { exact: true }).click({ button: 'right' });
   await expect(page.getByText('Close', { exact: true })).toHaveCount(1);
 
