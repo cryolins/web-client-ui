@@ -1,5 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 import {
+  attachGridDiagnostics,
   gotoPage,
   openTable,
   getColumnSeparatorPosition,
@@ -12,6 +13,10 @@ async function waitForLoadingDone(page: Page) {
     page.locator('.iris-grid .iris-grid-loading-status')
   ).toHaveCount(0);
 }
+
+test.afterEach(async ({ page }, testInfo) => {
+  await attachGridDiagnostics(page, testInfo);
+});
 
 test('can open a simple table', async ({ page }) => {
   await gotoPage(page, '');

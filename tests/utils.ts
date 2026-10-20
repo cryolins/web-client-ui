@@ -2,10 +2,12 @@ import {
   type Locator,
   expect,
   type Page,
+  type TestInfo,
   chromium,
   firefox,
   webkit,
 } from '@playwright/test';
+import { getGridDescription } from '@deephaven/playwright-grid';
 import os from 'node:os';
 
 export const HIDE_FROM_E2E_TESTS_CLASS = 'hide-from-e2e-tests';
@@ -517,6 +519,156 @@ export async function markerAtCoordinates(
   );
 }
 
+const GRID_CANVAS_SELECTOR = '.iris-grid-panel canvas.grid-canvas';
+
+/**
+ * Attach the state of the grid canvas to a failed test, so that a screenshot
+ * mismatch can be told apart from a canvas that was never drawn. Compares what
+ * the canvas itself holds (`grid-canvas-*` images, pixel counts, where
+ * `distinctColors` stops counting at 1000) with what Playwright's element
+ * screenshot captures a moment later.
+ * Does nothing for a test that passed, and never fails the test itself, as it
+ * only reads state after the real failure has been recorded.
+ * @param page Test page, which must still be open
+ * @param testInfo Info of the test that just ran
+ */
+export async function attachGridDiagnostics(
+  page: Page,
+  testInfo: TestInfo
+): Promise<void> {
+  if (testInfo.status === testInfo.expectedStatus || page.isClosed()) {
+    return;
+  }
+
+  const diagnostics: Record<string, unknown> = {};
+  const collect = async <T>(
+    name: string,
+    read: () => Promise<T>
+  ): Promise<T | undefined> => {
+    try {
+      const result = await read();
+      diagnostics[name] = result;
+      return result;
+    } catch (e) {
+      diagnostics[name] = { error: String(e) };
+      return undefined;
+    }
+  };
+
+  await collect('page', () =>
+    page.evaluate(async () => {
+      const frameDelayMs = await Promise.race([
+        new Promise<number>(resolve => {
+          const start = performance.now();
+          requestAnimationFrame(() => resolve(performance.now() - start));
+        }),
+        new Promise<null>(resolve => {
+          setTimeout(() => resolve(null), 1000);
+        }),
+      ]);
+      return {
+        userAgent: navigator.userAgent,
+        visibilityState: document.visibilityState,
+        hasFocus: document.hasFocus(),
+        devicePixelRatio: window.devicePixelRatio,
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        fontsStatus: document.fonts.status,
+        frameDelayMs,
+        gridPanels: document.querySelectorAll('.iris-grid-panel').length,
+        loadingStatus: document.querySelectorAll('.iris-grid-loading-status')
+          .length,
+        loadingSpinners: document.querySelectorAll('.loading-spinner').length,
+        messageOverlays: document.querySelectorAll(
+          '.iris-panel-message-overlay'
+        ).length,
+      };
+    })
+  );
+
+  // The canvas is read before anything else touches the grid
+  const canvasState = await collect('canvases', () =>
+    page.evaluate(selector => {
+      const dataUrls: string[] = [];
+      const canvases = Array.from(
+        document.querySelectorAll<HTMLCanvasElement>(selector)
+      ).map(canvas => {
+        const { x, y, width, height } = canvas.getBoundingClientRect();
+        const context = canvas.getContext('2d');
+        let nonEmptyPixels = null;
+        let distinctColors = null;
+        if (context != null && canvas.width > 0 && canvas.height > 0) {
+          const { data } = context.getImageData(
+            0,
+            0,
+            canvas.width,
+            canvas.height
+          );
+          const pixels = new Uint32Array(data.buffer);
+          const colors = new Set<number>();
+          let nonEmpty = 0;
+          for (let i = 0; i < pixels.length; i += 1) {
+            if (pixels[i] !== 0) {
+              nonEmpty += 1;
+            }
+            if (colors.size < 1000) {
+              colors.add(pixels[i]);
+            }
+          }
+          nonEmptyPixels = nonEmpty;
+          distinctColors = colors.size;
+        }
+        dataUrls.push(canvas.toDataURL('image/png'));
+        return {
+          width: canvas.width,
+          height: canvas.height,
+          styleWidth: canvas.style.width,
+          styleHeight: canvas.style.height,
+          boundingRect: { x, y, width, height },
+          isConnected: canvas.isConnected,
+          nonEmptyPixels,
+          distinctColors,
+        };
+      });
+      return { canvases, dataUrls };
+    }, GRID_CANVAS_SELECTOR)
+  );
+
+  const grid = page.locator('.iris-grid-panel .iris-grid').first();
+  const screenshot = await collect('screenshotAfterFailure', async () =>
+    grid.screenshot({ timeout: 5000 })
+  );
+
+  await collect('gridDescription', async () => getGridDescription(grid));
+
+  // The data URLs are attached as images, so keep them out of the JSON
+  if (canvasState != null) {
+    diagnostics.canvases = canvasState.canvases;
+  }
+  if (screenshot != null) {
+    diagnostics.screenshotAfterFailure = { bytes: screenshot.length };
+  }
+  await testInfo.attach('grid-diagnostics', {
+    body: JSON.stringify(diagnostics, null, 2),
+    contentType: 'application/json',
+  });
+  if (screenshot != null) {
+    await testInfo.attach('grid-screenshot-after-failure', {
+      body: screenshot,
+      contentType: 'image/png',
+    });
+  }
+  const dataUrls = canvasState?.dataUrls ?? [];
+  await Promise.all(
+    dataUrls.map(async (dataUrl, i) =>
+      testInfo.attach(`grid-canvas-${i}`, {
+        body: Buffer.from(dataUrl.slice(dataUrl.indexOf(',') + 1), 'base64'),
+        contentType: 'image/png',
+      })
+    )
+  );
+}
+
 export default {
   gotoPage,
   generateVarName,
@@ -530,4 +682,5 @@ export default {
   openTableOption,
   getColumnSeparatorPosition,
   dragColumnSeparator,
+  attachGridDiagnostics,
 };
