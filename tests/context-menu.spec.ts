@@ -18,19 +18,23 @@ async function moveMouseAwayFromTable(page: Page) {
   await page.mouse.click(0, 0);
 }
 
-const tableTest = test.extend({});
+const tableTest = test.extend<{ tableContextMenuSetup: void }>({
+  tableContextMenuSetup: [
+    async ({ page }, use) => {
+      await gotoPage(page, '');
+      await openTable(page, 'all_types');
 
-tableTest.beforeEach(async ({ page }) => {
-  await gotoPage(page, '');
-  await openTable(page, 'all_types');
+      const tableOperationsMenu = page.locator(
+        'data-testid=btn-iris-grid-settings-button-table'
+      );
+      await tableOperationsMenu.click();
 
-  const tableOperationsMenu = page.locator(
-    'data-testid=btn-iris-grid-settings-button-table'
-  );
-  await tableOperationsMenu.click();
-
-  // Wait for Table Options menu to show
-  await expect(page.locator('.table-sidebar')).toHaveCount(1);
+      // Wait for Table Options menu to show
+      await expect(page.locator('.table-sidebar')).toHaveCount(1);
+      await use();
+    },
+    { auto: true },
+  ],
 });
 
 tableTest('toggle column visibility', async ({ page }) => {
@@ -236,7 +240,7 @@ tableTest('go to', async ({ page }) => {
 test('open custom context menu with another custom context menu open', async ({
   page,
 }) => {
-  await gotoPage(page, '');
+  await page.goto('');
 
   await page.getByText('Console', { exact: true }).click({ button: 'right' });
   await expect(page.getByText('Close', { exact: true })).toHaveCount(1);
