@@ -48,9 +48,10 @@ test('test creating a file, saving it, reloading the page, closing it, re-openin
   // Reload page to check state of panel is saved
   await page.reload();
 
+  // The restored document is rendered in .view-lines; Monaco's hidden textarea is only an input proxy
   await expect(
-    page.locator('.script-editor .editor-container').locator('textarea')
-  ).not.toBeEmpty();
+    page.locator('.script-editor .editor-container .view-lines')
+  ).toContainText(message);
 
   // Click close on the notebook file .lm_close_tab
   await page.locator('.lm_close_tab').click();
