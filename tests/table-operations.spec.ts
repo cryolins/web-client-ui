@@ -244,9 +244,15 @@ test('conditional format', async ({ page }) => {
     const multiSelectInput = editor.locator('.dh-multi-select-input').first();
     await multiSelectInput.click();
     await multiSelectInput.pressSequentially('Double');
+    // The filter must have narrowed the list to Double alone; otherwise the
+    // first option focused by ArrowDown may be a stale, unfiltered entry.
+    await expect(page.getByRole('option')).toHaveCount(1);
     await expect(page.locator('[data-key="Double"]')).toBeVisible();
     await page.keyboard.press('ArrowDown'); // Focus first option in the listbox
     await page.keyboard.press('Enter'); // Toggle/select the focused option
+    await expect(
+      editor.locator('.dh-multi-select-trigger').getByText('Double')
+    ).toBeVisible();
     await page.keyboard.press('Escape');
 
     await doneButton.click();
