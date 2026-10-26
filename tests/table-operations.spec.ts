@@ -105,16 +105,30 @@ async function artificialWait(page: Page, tableNumber = 0) {
   await page.getByTestId('btn-page-close').first().click();
 }
 
+const consoleHistory = new WeakMap<Page, string[]>();
+
 test.beforeEach(async ({ page }) => {
+  const history: string[] = [];
+  consoleHistory.set(page, history);
+
   await gotoPage(page, '');
 
   // Fail quickly if console errors are detected
   page.on('console', msg => {
+    const loc = msg.location();
+    history.push(
+      `${new Date().toISOString()} [${msg.type()}] ${msg.text()} (${loc.url}:${
+        loc.lineNumber
+      }:${loc.columnNumber})`
+    );
     if (msg.type() === 'error') {
       throw new Error(msg.text());
     }
   });
   page.on('pageerror', error => {
+    history.push(
+      `${new Date().toISOString()} [pageerror] ${error.stack ?? error.message}`
+    );
     throw error;
   });
 
@@ -436,6 +450,20 @@ test('organize columns', async ({ page }) => {
 
     await expect(page.locator('.iris-grid-column')).toHaveScreenshot();
   });
+});
+
+test.afterEach(async ({ page }, testInfo) => {
+  const history = consoleHistory.get(page);
+  if (
+    testInfo.status !== testInfo.expectedStatus &&
+    history != null &&
+    history.length > 0
+  ) {
+    await testInfo.attach('console-history', {
+      body: history.join('\n'),
+      contentType: 'text/plain',
+    });
+  }
 });
 
 test('custom column', async ({ page, browserName }) => {
