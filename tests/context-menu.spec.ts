@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page, type TestInfo } from '@playwright/test';
 import {
   waitForLoadingDone,
   openTable,
@@ -18,7 +18,45 @@ async function moveMouseAwayFromTable(page: Page) {
   await page.mouse.click(0, 0);
 }
 
+const pageEvents = new WeakMap<Page, string[]>();
+
+function recordPageEvents(page: Page) {
+  const events: string[] = [];
+  const log = (message: string) =>
+    events.push(`${new Date().toISOString()} ${message}`);
+  pageEvents.set(page, events);
+  page.on('crash', () => log('crash'));
+  page.on('pageerror', err => log(`pageerror: ${err.message}`));
+  page.on('console', msg => {
+    if (msg.type() === 'error' || msg.type() === 'warning') {
+      log(`console.${msg.type()}: ${msg.text()}`);
+    }
+  });
+  page.on('requestfailed', req =>
+    log(`requestfailed: ${req.url()} ${req.failure()?.errorText}`)
+  );
+  page.on('framenavigated', frame => {
+    if (frame === page.mainFrame()) {
+      log(`navigated: ${frame.url()}`);
+    }
+  });
+}
+
+async function attachPageEvents(page: Page, testInfo: TestInfo) {
+  if (testInfo.status === testInfo.expectedStatus) {
+    return;
+  }
+  await testInfo.attach('page-events', {
+    body: [
+      `url: ${page.isClosed() ? 'closed' : page.url()}`,
+      ...(pageEvents.get(page) ?? []),
+    ].join('\n'),
+    contentType: 'text/plain',
+  });
+}
+
 test.beforeEach(async ({ page }) => {
+  recordPageEvents(page);
   await gotoPage(page, '');
   await openTable(page, 'all_types');
 
@@ -29,6 +67,10 @@ test.beforeEach(async ({ page }) => {
 
   // Wait for Table Options menu to show
   await expect(page.locator('.table-sidebar')).toHaveCount(1);
+});
+
+test.afterEach(async ({ page }, testInfo) => {
+  await attachPageEvents(page, testInfo);
 });
 
 test('toggle column visibility', async ({ page }) => {
