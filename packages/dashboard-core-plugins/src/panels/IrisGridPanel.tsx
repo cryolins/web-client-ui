@@ -659,6 +659,16 @@ export class IrisGridPanel extends PureComponent<
     value: boolean
   ): void {
     log.debug('handleAdvancedSettingsChange', key, value);
+    {
+      const w = window as any;
+      w.__dbgA = (w.__dbgA ?? 0) + 1;
+      if (w.__dbgA > 3) {
+        // eslint-disable-next-line no-console
+        console.warn('DBGCALL', w.__dbgA, key, value, new Error().stack);
+      }
+      clearTimeout(w.__dbgAT);
+      w.__dbgAT = setTimeout(() => { w.__dbgA = 0; }, 50);
+    }
     this.setState(({ advancedSettings }) =>
       advancedSettings.get(key) === value
         ? null
