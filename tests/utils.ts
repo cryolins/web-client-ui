@@ -2,6 +2,7 @@ import {
   type Locator,
   expect,
   type Page,
+  type TestInfo,
   chromium,
   firefox,
   webkit,
@@ -515,6 +516,107 @@ export async function markerAtCoordinates(
     },
     { x, y, color, size }
   );
+}
+
+/**
+ * Attaches the state of every grid canvas to the report when a test fails.
+ * Grid screenshot failures in WebKit have captured a completely blank canvas
+ * while the screencast showed the grid painted. Reading the canvas backing store
+ * separates "the grid never drew" from "the browser screenshot dropped the canvas".
+ * @param page
+ * @param testInfo
+ */
+export async function attachGridCanvasDiagnostics(
+  page: Page,
+  testInfo: TestInfo
+): Promise<void> {
+  if (testInfo.status === testInfo.expectedStatus || page.isClosed()) {
+    return;
+  }
+
+  try {
+    const canvases = await page
+      .locator('canvas.grid-canvas')
+      .evaluateAll(elements =>
+        elements.map(element => {
+          const canvas = element as HTMLCanvasElement;
+          const wrapper = canvas.parentElement;
+          const rect = canvas.getBoundingClientRect();
+          const info: Record<string, unknown> = {
+            isConnected: canvas.isConnected,
+            width: canvas.width,
+            height: canvas.height,
+            styleWidth: canvas.style.width,
+            styleHeight: canvas.style.height,
+            wrapperClientWidth: wrapper?.clientWidth,
+            wrapperClientHeight: wrapper?.clientHeight,
+            boundingRect: {
+              x: rect.x,
+              y: rect.y,
+              width: rect.width,
+              height: rect.height,
+            },
+            devicePixelRatio: window.devicePixelRatio,
+            visibilityState: document.visibilityState,
+          };
+          try {
+            const context = canvas.getContext('2d');
+            if (context == null) {
+              info.context = null;
+            } else if (canvas.width > 0 && canvas.height > 0) {
+              const { data } = context.getImageData(
+                0,
+                0,
+                canvas.width,
+                canvas.height
+              );
+              let opaquePixels = 0;
+              const colors = new Set<string>();
+              for (let i = 0; i < data.length; i += 4) {
+                if (data[i + 3] !== 0) {
+                  opaquePixels += 1;
+                }
+                if (colors.size < 1000) {
+                  colors.add(data.slice(i, i + 4).join(','));
+                }
+              }
+              info.opaquePixels = opaquePixels;
+              info.totalPixels = data.length / 4;
+              info.distinctColors = colors.size;
+              info.dataUrl = canvas.toDataURL('image/png');
+            }
+          } catch (e) {
+            info.readError = String(e);
+          }
+          return info;
+        })
+      );
+
+    await Promise.all(
+      canvases.map(async ({ dataUrl, ...info }, i) => {
+        await testInfo.attach(`grid-canvas-${i}-state`, {
+          body: JSON.stringify(info, null, 2),
+          contentType: 'application/json',
+        });
+        if (typeof dataUrl === 'string') {
+          await testInfo.attach(`grid-canvas-${i}-backing-store`, {
+            body: Buffer.from(dataUrl.split(',')[1], 'base64'),
+            contentType: 'image/png',
+          });
+        }
+      })
+    );
+
+    await testInfo.attach('page-screenshot-after-failure', {
+      body: await page.screenshot(),
+      contentType: 'image/png',
+    });
+  } catch (e) {
+    await testInfo.attach('grid-canvas-diagnostics-error', {
+      body: String(e),
+      contentType: 'text/plain',
+    });
+  }
 }
 
 export default {

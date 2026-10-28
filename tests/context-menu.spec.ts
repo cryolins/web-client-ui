@@ -4,6 +4,7 @@ import {
   openTable,
   expectContextMenus,
   gotoPage,
+  attachGridCanvasDiagnostics,
 } from './utils';
 
 async function openAdvancedFilters(page: Page) {
@@ -29,6 +30,10 @@ test.beforeEach(async ({ page }) => {
 
   // Wait for Table Options menu to show
   await expect(page.locator('.table-sidebar')).toHaveCount(1);
+});
+
+test.afterEach(async ({ page }, testInfo) => {
+  await attachGridCanvasDiagnostics(page, testInfo);
 });
 
 test('toggle column visibility', async ({ page }) => {
