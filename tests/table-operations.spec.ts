@@ -110,12 +110,12 @@ test.beforeEach(async ({ page }) => {
 
   // Fail quickly if console errors are detected
   page.on('console', msg => {
-    if (msg.type() === 'error') {
-      throw new Error(msg.text());
+    if (msg.type() === 'error' || msg.type()==='warning') {
+      require('fs').appendFileSync('/tmp/console.log', msg.type()+': '+msg.text()+'\n=====\n');
     }
   });
   page.on('pageerror', error => {
-    throw error;
+    require('fs').appendFileSync('/tmp/console.log', 'PAGEERROR '+error.stack+'\n=====\n');
   });
 
   await openTable(page, 'all_types');

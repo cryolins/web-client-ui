@@ -983,6 +983,18 @@ class IrisGrid extends Component<IrisGridProps, IrisGridState> {
   }
 
   componentDidUpdate(prevProps: IrisGridProps, prevState: IrisGridState): void {
+    {
+      const w = window as any;
+      w.__dbgN = (w.__dbgN ?? 0) + 1;
+      const pk = Object.keys(this.props).filter(k => (this.props as any)[k] !== (prevProps as any)[k]);
+      const sk = Object.keys(this.state).filter(k => (this.state as any)[k] !== (prevState as any)[k]);
+      if (w.__dbgN > 20) {
+        // eslint-disable-next-line no-console
+        console.warn('DBGLOOP', w.__dbgN, 'props', pk.join(','), 'state', sk.join(','));
+      }
+      clearTimeout(w.__dbgT);
+      w.__dbgT = setTimeout(() => { w.__dbgN = 0; }, 50);
+    }
     const {
       inputFilters,
       isSelectingColumn,
