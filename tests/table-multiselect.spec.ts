@@ -63,6 +63,21 @@ async function filterAndScreenshot(
   });
 }
 
+// Attach the grid loading state on failure so a stuck loading status bar can be diagnosed
+test.afterEach(async ({ page }, testInfo) => {
+  if (testInfo.status === testInfo.expectedStatus) {
+    return;
+  }
+  const loadingState = await page
+    .locator('.iris-grid-loading')
+    .evaluateAll(elements => elements.map(el => el.outerHTML))
+    .catch(e => `Unable to read loading state: ${String(e)}`);
+  await testInfo.attach('iris-grid-loading-state', {
+    body: JSON.stringify(loadingState, null, 2),
+    contentType: 'application/json',
+  });
+});
+
 // these are select filters that do not do multiselect
 function runSpecialSelectFilter(
   columnType: 'null' | 'empty' | 'bool',
