@@ -188,8 +188,12 @@ test.describe('scrolling', () => {
     await page.keyboard.press('PageDown');
     await waitForLoadingDone(page);
 
+    // The scroll is applied asynchronously after the key press, so retry
+    // until the snapshot reflects the new viewport
+    await expect
+      .poll(async () => (await getVisibleRows(grid))[0])
+      .toBeGreaterThan(0);
     const rows = await getVisibleRows(grid);
-    expect(rows[0]).toBeGreaterThan(0);
 
     // Headers must not shift when only the rows scroll
     await expectColumnHeaderNames(grid, ['x', 'y', 'z']);
