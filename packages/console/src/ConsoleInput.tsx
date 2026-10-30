@@ -293,7 +293,13 @@ export class ConsoleInput extends PureComponent<
 
     MonacoUtils.registerPasteHandler(this.commandEditor);
 
-    this.commandEditor.focus();
+    // Monaco may finish loading after the user has focused another control.
+    if (
+      document.activeElement === document.body ||
+      element.contains(document.activeElement)
+    ) {
+      this.commandEditor.focus();
+    }
 
     this.resizeObserver.observe(element);
   }
