@@ -4,6 +4,7 @@ import {
   type Page,
   chromium,
   firefox,
+  test,
   webkit,
 } from '@playwright/test';
 import os from 'node:os';
@@ -42,6 +43,44 @@ type PlotNames = 'simple_plot' | 'trig_figure';
 
 type PanelNames = TableNames | PlotNames;
 
+const crashDiagnosticsPages = new WeakSet<Page>();
+
+/**
+ * Records page errors and console errors, and attaches them to the test report
+ * if the renderer crashes. Playwright only reports "Target crashed" in that
+ * case, which says nothing about what the page was doing beforehand.
+ */
+function attachDiagnosticsOnCrash(page: Page): void {
+  if (crashDiagnosticsPages.has(page)) {
+    return;
+  }
+  crashDiagnosticsPages.add(page);
+
+  const testInfo = test.info();
+  const events: string[] = [];
+  const record = (message: string) => {
+    events.push(`${new Date().toISOString()} ${message}`);
+  };
+  page.on('pageerror', error => record(`pageerror: ${error.message}`));
+  page.on('console', msg => {
+    if (msg.type() === 'error' || msg.type() === 'warning') {
+      record(`console.${msg.type()}: ${msg.text()}`);
+    }
+  });
+  page.on('requestfailed', request =>
+    record(`requestfailed: ${request.url()} ${request.failure()?.errorText}`)
+  );
+  page.on('crash', () => {
+    record(`crash: page crashed at ${page.url()}`);
+    testInfo
+      .attach('page-crash-diagnostics', {
+        body: events.join('\n'),
+        contentType: 'text/plain',
+      })
+      .catch(() => undefined);
+  });
+}
+
 export async function gotoPage(
   page: Page,
   url: string,
@@ -51,6 +90,7 @@ export async function gotoPage(
     waitUntil?: 'load' | 'domcontentloaded' | 'networkidle' | 'commit';
   }
 ): Promise<void> {
+  attachDiagnosticsOnCrash(page);
   await page.goto(url, options);
   await expect(
     page.getByRole('progressbar', { name: 'Loading...', exact: true })
