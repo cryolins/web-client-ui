@@ -236,6 +236,9 @@ test('open custom context menu with another custom context menu open', async ({
 }) => {
   await page.goto('');
 
+  // Console initialization focuses the editor, dismissing any open context menu.
+  await expect(page.locator('.console-input textarea')).toBeFocused();
+
   await page.getByText('Console', { exact: true }).click({ button: 'right' });
   await expect(page.getByText('Close', { exact: true })).toHaveCount(1);
 
