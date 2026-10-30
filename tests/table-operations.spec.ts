@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page, type TestInfo } from '@playwright/test';
 import {
   makeTableCommand,
   pasteInMonaco,
@@ -105,8 +105,55 @@ async function artificialWait(page: Page, tableNumber = 0) {
   await page.getByTestId('btn-page-close').first().click();
 }
 
+// Console error details (location, serialized args, stack) collected without
+// altering the fail-fast handlers below, so a failure like the JS API's
+// "User callback ... failed: JavaScriptException" can be traced to its cause.
+const consoleDiagnostics = new WeakMap<Page, string[]>();
+
+test.afterEach(async ({ page }, testInfo: TestInfo) => {
+  const entries = consoleDiagnostics.get(page) ?? [];
+  if (testInfo.status !== testInfo.expectedStatus && entries.length > 0) {
+    await testInfo.attach('console-error-diagnostics', {
+      body: entries.join('\n\n'),
+      contentType: 'text/plain',
+    });
+  }
+});
+
 test.beforeEach(async ({ page }) => {
   await gotoPage(page, '');
+
+  const diagnostics: string[] = [];
+  consoleDiagnostics.set(page, diagnostics);
+  page.on('console', msg => {
+    if (msg.type() !== 'error') return;
+    const { url, lineNumber, columnNumber } = msg.location();
+    Promise.all(
+      msg.args().map(async arg => {
+        try {
+          return JSON.stringify(await arg.jsonValue());
+        } catch (e) {
+          return `<unserializable: ${String(e)}>`;
+        }
+      })
+    )
+      .then(args =>
+        diagnostics.push(
+          `${new Date().toISOString()} console.error ${msg.text()}\n` +
+            `  at ${url}:${lineNumber}:${columnNumber}\n  args: ${args.join(
+              ' | '
+            )}`
+        )
+      )
+      .catch(() => undefined);
+  });
+  page.on('pageerror', error => {
+    diagnostics.push(
+      `${new Date().toISOString()} pageerror ${error.name}: ${error.message}\n${
+        error.stack ?? ''
+      }`
+    );
+  });
 
   // Fail quickly if console errors are detected
   page.on('console', msg => {
