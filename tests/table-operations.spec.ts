@@ -311,7 +311,7 @@ test('conditional format', async ({ page }) => {
   });
 });
 
-test('organize columns', async ({ page }) => {
+test('organize columns', async ({ page }, testInfo) => {
   await openTableOption(page, 'Organize Columns');
 
   await test.step('Search', async () => {
@@ -322,6 +322,36 @@ test('organize columns', async ({ page }) => {
     await page.keyboard.type('bigd');
     await page.keyboard.press('ArrowDown');
     await page.keyboard.press('Enter');
+
+    // Diagnostics for intermittent firefox pixel diffs: capture the DOM state
+    // at the moment the screenshot assertion runs.
+    await testInfo.attach('organize-columns-search-state', {
+      contentType: 'application/json',
+      body: JSON.stringify(
+        await page.evaluate(() => {
+          const builder = document.querySelector(
+            '.visibility-ordering-builder'
+          );
+          const active = document.activeElement;
+          return {
+            searchListCount: document.querySelectorAll(
+              '.visibility-search-list'
+            ).length,
+            activeElement: active
+              ? `${active.tagName}.${active.className}`
+              : null,
+            scrollTops: Array.from(builder?.querySelectorAll('*') ?? [])
+              .filter(el => el.scrollTop > 0)
+              .map(el => ({ cls: el.className, top: el.scrollTop })),
+            selectedItems: Array.from(
+              builder?.querySelectorAll('.tree-item.selected') ?? []
+            ).map(el => el.textContent),
+          };
+        }),
+        null,
+        2
+      ),
+    });
 
     await expect(
       page.locator('.visibility-ordering-builder')
