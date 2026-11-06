@@ -1,11 +1,6 @@
 import { test, expect } from '@playwright/test';
-import { gotoPage } from './utils';
 
 test.describe('app loading tests', () => {
-  test.beforeEach(async ({ page }) => {
-    await gotoPage(page, '');
-  });
-
   test('initial dashboard is immediately ready after `gotoPage` has completed', async ({
     page,
   }) => {
