@@ -95,10 +95,11 @@ test('lazy loads mathjax', async ({ page }) => {
     await findChunkContaining(requests, LIBRARY_MARKERS.mathjax)
   ).toBeUndefined();
 
-  const controlsButton = page.getByText('Controls');
-  await controlsButton.click();
-  const markdownButton = page.getByText('Markdown Widget');
-  await markdownButton.click();
+  // The console grabs focus once it loads, which closes any menu opened before
+  await expect(page.locator('.console-input textarea')).toBeFocused();
+
+  await page.getByRole('button', { name: 'Controls' }).click();
+  await page.getByText('Markdown Widget').click();
 
   await expect(page.locator('.markdown-panel')).toBeVisible({
     timeout: 30_000, // Webkit takes a while for this sometimes
