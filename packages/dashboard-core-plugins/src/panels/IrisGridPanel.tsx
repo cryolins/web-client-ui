@@ -704,8 +704,14 @@ export class IrisGridPanel extends PureComponent<
     this.irisGridState = irisGridState;
     this.gridState = gridState;
 
-    // Grid sends it's first state change after it's finished loading
-    this.setState({ isLoaded: true, isLoading: false });
+    // Grid sends it's first state change after it's finished loading.
+    // It sends a state change on every update, and a setState from within its componentDidUpdate
+    // re-renders this panel, so only set state when it will actually change to avoid
+    // an endless update cycle between the panel and the grid.
+    const { isLoaded, isLoading } = this.state;
+    if (!isLoaded || isLoading) {
+      this.setState({ isLoaded: true, isLoading: false });
+    }
 
     this.savePanelState();
 
