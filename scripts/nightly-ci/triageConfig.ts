@@ -2,7 +2,7 @@ import type { Classification } from './triageTypes.ts';
 
 export const HISTORY_WINDOW = Number(process.env.HISTORY_WINDOW ?? 20);
 export const ESCALATE_AFTER_ATTEMPTS = Number(
-  process.env.ESCALATE_AFTER_ATTEMPTS ?? 2
+  process.env.ESCALATE_AFTER_ATTEMPTS ?? 10
 );
 // Ratio of failed tests in a single night that signals a wider failure problem.
 export const BROAD_FAILURE_RATIO = Number(
