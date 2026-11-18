@@ -19,6 +19,9 @@ export function stripAnsi(text = ''): string {
 export function normalizeError(message = '', stackTop = ''): string {
   return (
     stripAnsi(`${message}\n${stackTop}`)
+      // Browser frames come from minified, content-hashed bundles: names and hashes change
+      // every build, so they would give each build its own fingerprint for the same error.
+      .replace(/^[ \t]*at\s.*https?:\/\/.*$/gm, '')
       .replace(
         /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
         '<uuid>'
