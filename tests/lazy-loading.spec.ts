@@ -85,8 +85,13 @@ test('lazy loads plotly', async ({ page }) => {
   await expectMinimumResponseSize(plotlyRequest, 300 * 1000); // 300kB
 });
 
-test('lazy loads mathjax', async ({ page }) => {
+test('lazy loads mathjax', async ({ page }, testInfo) => {
   const requests = recordRequests(page);
+  const pageErrors: string[] = [];
+  page.on('pageerror', error => pageErrors.push(error.message));
+  page.on('console', msg => {
+    if (msg.type() === 'error') pageErrors.push(msg.text());
+  });
 
   await page.goto('');
   await page.waitForLoadState('networkidle');
@@ -95,10 +100,23 @@ test('lazy loads mathjax', async ({ page }) => {
     await findChunkContaining(requests, LIBRARY_MARKERS.mathjax)
   ).toBeUndefined();
 
-  const controlsButton = page.getByText('Controls');
-  await controlsButton.click();
-  const markdownButton = page.getByText('Markdown Widget');
-  await markdownButton.click();
+  try {
+    await page.getByText('Controls').click();
+    await page.getByText('Markdown Widget').click();
+  } catch (e) {
+    // Records why the Controls menu item can detach before it is clicked
+    await testInfo.attach('controls-menu-state', {
+      contentType: 'application/json',
+      body: JSON.stringify({
+        pageErrors,
+        controlsMenuHtml: await page
+          .locator('.controls-menu-popper')
+          .innerHTML({ timeout: 1000 })
+          .catch(() => 'controls menu not in DOM'),
+      }),
+    });
+    throw e;
+  }
 
   await expect(page.locator('.markdown-panel')).toBeVisible({
     timeout: 30_000, // Webkit takes a while for this sometimes
