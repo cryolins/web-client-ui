@@ -40,7 +40,20 @@ async function scrollTableWhileMovingMouse(page: Page) {
   }
 }
 
+const diagnostics = new WeakMap<Page, string[]>();
+
 test.beforeEach(async ({ page }) => {
+  // Record load-time diagnostics so a stuck bootstrap spinner can be diagnosed from the report
+  const log: string[] = [];
+  diagnostics.set(page, log);
+  page.on('console', msg => log.push(`console.${msg.type()}: ${msg.text()}`));
+  page.on('requestfailed', req =>
+    log.push(`requestfailed: ${req.url()} ${req.failure()?.errorText}`)
+  );
+  page.on('response', res => {
+    if (res.status() >= 400) log.push(`response ${res.status()}: ${res.url()}`);
+  });
+
   await gotoPage(page, '');
 
   // Fail quickly if console errors are detected
@@ -52,6 +65,15 @@ test.beforeEach(async ({ page }) => {
   page.on('pageerror', error => {
     throw error;
   });
+});
+
+test.afterEach(async ({ page }, testInfo) => {
+  if (testInfo.status !== testInfo.expectedStatus) {
+    await testInfo.attach('load-diagnostics', {
+      body: (diagnostics.get(page) ?? []).join('\n') || 'no events recorded',
+      contentType: 'text/plain',
+    });
+  }
 });
 
 test('scroll with keyboard shortcuts', async ({ page }) => {
@@ -219,7 +241,9 @@ test('html element has overscroll-behavior-x none to prevent browser back naviga
   await waitForLoadingDone(page);
 
   const htmlOverscrollX = await page.evaluate(() =>
-    window.getComputedStyle(document.documentElement).getPropertyValue('overscroll-behavior-x')
+    window
+      .getComputedStyle(document.documentElement)
+      .getPropertyValue('overscroll-behavior-x')
   );
   expect(htmlOverscrollX).toBe('none');
 });
