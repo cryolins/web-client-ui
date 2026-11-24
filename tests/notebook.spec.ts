@@ -27,6 +27,10 @@ test('test creating a file, saving it, reloading the page, closing it, re-openin
     command
   );
 
+  await expect(
+    page.locator('.script-editor .editor-container .view-lines')
+  ).toContainText(message);
+
   // Click the Save button
   await page.locator('[aria-label="Save"]').click();
 
@@ -39,18 +43,25 @@ test('test creating a file, saving it, reloading the page, closing it, re-openin
   // Click button:has-text("Save")
   await page.locator('button:has-text("Save")').click();
 
-  // Pause so the save can actually finish
-  // We eagerly show the save status, so can't use that to detect save finish
-  await new Promise(resolve => {
-    setTimeout(resolve, 2000);
-  });
+  // The notebook's file metadata is only persisted in the workspace layout once
+  // the save has succeeded, so reloading before that restores an empty notebook
+  await expect
+    .poll(() =>
+      page.evaluate(
+        ([key, name]) =>
+          localStorage.getItem(key)?.includes(`"itemName":"/${name}"`) ?? false,
+        ['deephaven.WorkspaceStorage', filename]
+      )
+    )
+    .toBe(true);
 
   // Reload page to check state of panel is saved
   await page.reload();
 
+  // The Monaco input textarea only mirrors the selection, so check the rendered lines
   await expect(
-    page.locator('.script-editor .editor-container').locator('textarea')
-  ).not.toBeEmpty();
+    page.locator('.script-editor .editor-container .view-lines')
+  ).toContainText(message);
 
   // Click close on the notebook file .lm_close_tab
   await page.locator('.lm_close_tab').click();
