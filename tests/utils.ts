@@ -2,9 +2,11 @@ import {
   type Locator,
   expect,
   type Page,
+  type Request,
   chromium,
   firefox,
   webkit,
+  test,
 } from '@playwright/test';
 import os from 'node:os';
 
@@ -51,10 +53,46 @@ export async function gotoPage(
     waitUntil?: 'load' | 'domcontentloaded' | 'networkidle' | 'commit';
   }
 ): Promise<void> {
-  await page.goto(url, options);
-  await expect(
-    page.getByRole('progressbar', { name: 'Loading...', exact: true })
-  ).not.toBeVisible();
+  const failedRequests: string[] = [];
+  const onRequestFailed = (request: Request): void => {
+    failedRequests.push(
+      `${request.method()} ${request.url()}: ${request.failure()?.errorText}`
+    );
+  };
+  page.on('requestfailed', onRequestFailed);
+  const startTime = Date.now();
+  try {
+    await page.goto(url, options);
+    await expect(
+      page.getByRole('progressbar', { name: 'Loading...', exact: true })
+    ).not.toBeVisible();
+  } catch (e) {
+    // Additive diagnostics only; the original error is rethrown unchanged
+    try {
+      const state = await page.evaluate(() => ({
+        readyState: document.readyState,
+        spinnerTestIds: Array.from(
+          document.querySelectorAll('[role="progressbar"]')
+        ).map(el => el.getAttribute('data-testid')),
+        resources: performance
+          .getEntriesByType('resource')
+          .map(r => `${r.name} ${Math.round(r.duration)}ms`),
+      }));
+      await test.info().attach('gotoPage-diagnostics', {
+        body: JSON.stringify(
+          { elapsedMs: Date.now() - startTime, failedRequests, ...state },
+          null,
+          2
+        ),
+        contentType: 'application/json',
+      });
+    } catch {
+      // Page may be closed or crashed; nothing more to collect
+    }
+    throw e;
+  } finally {
+    page.off('requestfailed', onRequestFailed);
+  }
 }
 
 /**
