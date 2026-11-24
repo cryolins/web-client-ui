@@ -27,6 +27,10 @@ test('test creating a file, saving it, reloading the page, closing it, re-openin
     command
   );
 
+  await expect(
+    page.locator('.script-editor .editor-container .view-lines')
+  ).toContainText(message);
+
   // Click the Save button
   await page.locator('[aria-label="Save"]').click();
 
@@ -39,18 +43,26 @@ test('test creating a file, saving it, reloading the page, closing it, re-openin
   // Click button:has-text("Save")
   await page.locator('button:has-text("Save")').click();
 
-  // Pause so the save can actually finish
-  // We eagerly show the save status, so can't use that to detect save finish
-  await new Promise(resolve => {
-    setTimeout(resolve, 2000);
-  });
+  // The reload restores the panel from the persisted workspace, so wait for the
+  // saved file to be recorded there
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => localStorage.getItem('deephaven.WorkspaceStorage') ?? ''
+      )
+    )
+    .toContain(`"itemName":"/${filename}"`);
 
   // Reload page to check state of panel is saved
-  await page.reload();
-
-  await expect(
-    page.locator('.script-editor .editor-container').locator('textarea')
-  ).not.toBeEmpty();
+  // The save is eagerly shown as finished but completes on the server
+  // asynchronously, so a reload can load the file before its contents are
+  // written. Reload until the saved contents are loaded.
+  await expect(async () => {
+    await page.reload();
+    await expect(
+      page.locator('.script-editor .editor-container .view-lines')
+    ).toContainText(message, { timeout: 5000 });
+  }).toPass({ timeout: 30000 });
 
   // Click close on the notebook file .lm_close_tab
   await page.locator('.lm_close_tab').click();
